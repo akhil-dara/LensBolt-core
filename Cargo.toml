@@ -1,0 +1,37 @@
+[package]
+name = "lensbolt-core"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/akhil-dara/lensbolt-core"
+description = "LensBolt optical file-transfer codec and protocol"
+
+[lib]
+name = "lensbolt_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lensbolt"
+path = "src/bin/lensbolt.rs"
+required-features = ["cli"]
+
+[dependencies]
+sha2 = "0.10"
+zstd = { version = "0.13", optional = true }
+png = "0.17"
+# pure-Rust zstd decoding for builds without the zstd C library (WebAssembly receivers)
+ruzstd = "0.7"
+clap = { version = "4", features = ["derive"], optional = true }
+
+[features]
+# zstd is C code: on by default (CLI, desktop, Android); off for WebAssembly, where files are sent as-is
+default = ["zstd", "cli"]
+cli = ["dep:clap"]
+zstd = ["dep:zstd"]
+
+[profile.release]
+opt-level = 3
+debug = 1
+
+[profile.dev]
+opt-level = 1
