@@ -28,6 +28,14 @@ pub fn extract_payload(reads: &FlatReads, grid: &FlatGrid) -> FramePayload {
         let n = (grid.cols() * grid.rows()) as usize;
         return extract_cells(grid, &vec![0; n], &vec![0; n], Some(&vec![false; n]), None);
     }
+    // the cells of flat blocks (covered, blown out) are unreadable: missing, so their bytes are erasures (one
+    // parity byte each) instead of confident errors (two)
+    if reads.block_tag.contains(&super::read::TAG_FLAT) {
+        let (bw, _) = grid.blocks();
+        let present: Vec<bool> = (0..grid.rows()).flat_map(|r| (0..grid.cols()).map(move |c| (c, r)))
+            .map(|(c, r)| reads.block_tag.get(((r / super::layout::BLOCK) * bw + c / super::layout::BLOCK) as usize) != Some(&super::read::TAG_FLAT)).collect();
+        return extract_cells(grid, &reads.values, &reads.margins, Some(&present), None);
+    }
     extract_cells(grid, &reads.values, &reads.margins, None, None)
 }
 

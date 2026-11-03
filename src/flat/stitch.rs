@@ -87,6 +87,8 @@ impl Stitcher {
         // not a stripe
         let frame_of = |b: usize| -> Option<(u8, bool)> {
             let t = *reads.block_tag.get(b)?;
+            // a flat block (covered, blown out) is unreadable: its cells stay missing for a later capture
+            if t == super::read::TAG_FLAT { return None; }
             if t == super::read::TAG_UNKNOWN { return Some((hdr.frame_seq, true)); }
             match (t.wrapping_sub(ht)) & 3 { 0 => Some((hdr.frame_seq, false)), 1 => Some((hdr.frame_seq.wrapping_add(1), false)), 3 => Some((hdr.frame_seq.wrapping_sub(1), false)), _ => None }
         };

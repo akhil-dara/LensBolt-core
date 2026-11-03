@@ -103,6 +103,36 @@ fn diagonal_rolls_decode() {
     }
 }
 
+/// Part of the tile covered on the sender's screen: a notification box (light grey) or a thumb in front of the
+/// camera (dark), 4% of the tile, away from the corner markers. Every codeword spans the whole tile, so a
+/// covered patch puts errors in all of them; the covered blocks' pilots barely swing, the reader marks those
+/// blocks unknown and their cells come to Reed-Solomon as erasures (one parity byte each instead of two). The
+/// b/w formats read on the luma path, as the phone reads them. Before: 21-32 of 111 codewords at 2 px, 6-11 of
+/// 49 at 3 px. The ceiling is the format's parity: b/w keeps 24 bytes, 16 after the spare, about 6% of a
+/// codeword: 5% covered reads 109-110 of 111 at 2 px and 45-49 of 49 at 3 px, 8% reads nothing.
+#[test]
+fn covered_patch_decodes() {
+    for (k, (pitch, alphabet, level)) in [(2u8, Alphabet::Bw, 200u8), (2, Alphabet::Bw, 30), (3, Alphabet::Bw, 200), (3, Alphabet::Bw, 30), (4, Alphabet::C8, 200)].into_iter().enumerate() {
+        let (g, f, payload) = frame(CellFormat { pitch, alphabet }, 50 + k as u32);
+        let mut im = render(&f);
+        let side = (0.04f32.sqrt() * 1024.0) as u32;
+        let (x0, y0) = if level > 100 { (1024 - side - 10, 512 - side / 2) } else { (512 - side / 2, 512 - side / 2) };
+        for y in y0..y0 + side { for x in x0..x0 + side { im.set(x, y, [level, level, level]); } }
+        let cam = synth(&im, 1920, 1440, 1024.0 * if pitch == 2 { 1.0 } else { 1.2 }, 4.0, 1.0, 3, 60 + k as u64);
+        let what = format!("{pitch} px {alphabet:?}, 4% covered at level {level}");
+        let read = if alphabet == Alphabet::Bw { FlatDecoder::new().decode_luma(&cam.to_gray(), None).map(|mut v| v.remove(0)) } else { FlatDecoder::new().decode(&cam) };
+        let read = read.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        let fp = read.payload();
+        let n = g.codewords();
+        assert!(fp.codewords_ok * 100 >= n * 95, "{what}: alone {}/{n} ({} failed, {} not tried)", fp.codewords_ok, fp.codewords_failed, fp.codewords_missing);
+        assert!(fp.bytes.iter().zip(&payload).zip(&fp.valid).all(|((a, b), &v)| !v || a == b), "{what}: a byte marked valid is wrong");
+        let mut st = lensbolt_core::flat::stitch::Stitcher::new();
+        let out = st.add(&read);
+        let ok: usize = out.iter().filter(|(h, _)| h.frame_seq == f.header.frame_seq).map(|(_, p)| p.codewords_ok).sum();
+        assert!(ok * 100 >= n * 95, "{what}: through the stitcher {ok}/{n}");
+    }
+}
+
 /// A dim or washed-out screen: black and white only 20 camera levels apart (a panel at low brightness in a dark
 /// room, or glare lifting the blacks), with sensor noise. The cells read; the geometry's border checks must not
 /// demand a fixed 20-level step.

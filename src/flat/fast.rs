@@ -10,7 +10,7 @@
 //! (`equalise_bw`), which keeps small and tilted tiles reading (docs/2026-10-31-fhd-2px-floor.md).
 
 use super::layout::{Chrome, FlatCell, FlatGrid, BLOCK, CELL_DATA, CELL_PAST, CELL_PILOT, PILOT_LOCAL};
-use super::read::{assign_tags, pattern_decide_grid, sampling, FlatReads, Pilot, TAG_UNKNOWN};
+use super::read::{assign_tags, pattern_decide_grid, sampling, tag_known, FlatReads, Pilot, TAG_FLAT};
 use crate::detect::Homography;
 use crate::image::GrayImage;
 use crate::par::{par_map, par_ranges};
@@ -275,6 +275,40 @@ fn pilot_window(src: &GrayImage, pts: impl Iterator<Item = (f32, f32, f32)> + Cl
         }
     }
     v
+}
+
+/// A block whose samples spread less than this share of the median block's is covered or blown out
+/// (`mark_flat_blocks`). A covered block spreads by the sensor's noise (a few levels against 40+); blur, small
+/// cells and glare lower the spread of every block in their region alike, and stay well above it.
+const FLAT_SPREAD: f32 = 0.2;
+
+/// Blocks whose 64 cell samples barely spread become `TAG_FLAT`: a patch of the tile covered (a
+/// notification over the sender, a thumb in front of the camera) or blown out. Real data always spreads (a
+/// random mix of levels, blur or not); a covered patch is one flat level. In b/w the frame tag cannot tell:
+/// two tagged pilots of two colours make four patterns, one per tag, so even a solid patch fits a tag exactly
+/// and its confident, wrong cells cost Reed-Solomon two parity bytes each; as erasures they cost one.
+/// Measured: 4% of a 2 px b/w tile covered read 46 of 111 codewords, 5% 21-32; now 109-111. (The four pilots
+/// alone are too few: at 1.7 camera px per cell their swing flagged readable blocks.)
+fn mark_flat_blocks(block_tag: &mut [u8], raw: &[f32], cols: u32, rows: u32, bw: u32) {
+    let mut acc = vec![(0u32, 0f64, 0f64); block_tag.len()];
+    for r in 0..rows {
+        let row = &raw[(r * cols) as usize..((r + 1) * cols) as usize];
+        let base = ((r / BLOCK) * bw) as usize;
+        for (c, &v) in row.iter().enumerate() {
+            if v.is_nan() { continue; }
+            let a = &mut acc[base + c / BLOCK as usize];
+            a.0 += 1; a.1 += v as f64; a.2 += (v as f64) * (v as f64);
+        }
+    }
+    let spread: Vec<Option<f32>> = acc.iter().map(|&(n, s, ss)| (n >= 32).then(|| { let m = s / n as f64; (ss / n as f64 - m * m).max(0.0).sqrt() as f32 })).collect();
+    let mut known: Vec<f32> = spread.iter().flatten().copied().collect();
+    if known.len() < 8 { return; }
+    let mid = known.len() / 2;
+    let median = *known.select_nth_unstable_by(mid, f32::total_cmp).1;
+    if median <= 0.0 { return; }
+    for (b, sd) in spread.iter().enumerate() {
+        if sd.is_some_and(|sd| sd < FLAT_SPREAD * median) { block_tag[b] = TAG_FLAT; }
+    }
 }
 
 /// Per column of a grid row, the inputs of `sample_row`: the homography's terms in x (m0 x, m3 x, m6 x for
@@ -1116,14 +1150,14 @@ fn read_cells_luma_from(y: &GrayImage, grid: &FlatGrid, h: &Homography, tag_hint
         tagged[p.block] += 1;
     }
     for b in 0..nblocks { if tagged[b] < 2 { tcost[b] = [0.0; 4]; } }
-    let block_tag = assign_tags(&tcost, &tagged, bh as usize, bw as usize);
-    for p in pilots.iter_mut() { let t = block_tag[p.block]; if t != TAG_UNKNOWN { p.colour = grid.pilot_colour_at(p.col, p.row, t); } }
+    let mut block_tag = assign_tags(&tcost, &tagged, bh as usize, bw as usize);
+    for p in pilots.iter_mut() { let t = block_tag[p.block]; if tag_known(t) { p.colour = grid.pilot_colour_at(p.col, p.row, t); } }
     // refinement with every pilot (tags known) pooled over a wider block neighbourhood: 7x7 blocks at 1 px,
     // as read_cells' tuning (measured on real 1 px capture 0: the anchor field without this refinement 0.874%
     // cell errors, with it pooled over 3x3 blocks 0.631%, over 7x7 0.526%), 3x3 above; two rounds at a
     // halving step
     let mut all_by_block: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
-    for (i, p) in pilots.iter().enumerate() { if block_tag[p.block] != TAG_UNKNOWN { all_by_block[p.block].push(i); } }
+    for (i, p) in pilots.iter().enumerate() { if tag_known(block_tag[p.block]) { all_by_block[p.block].push(i); } }
     // 7x7 at 1 px: 5x5 measured +0.02 pt cell errors on the real captures for ~20 ms
     let pool: i64 = if fmt.pitch == 1 { 3 } else { 1 };
     // a 5x5 candidate window from 2 px up (neighbours a lattice step apart at most) measured on the degraded
@@ -1205,7 +1239,7 @@ fn read_cells_luma_from(y: &GrayImage, grid: &FlatGrid, h: &Homography, tag_hint
     }) };
     // a capture that straddles the manifest (blocks whose pilots fit no tag) is not pre-checked: its data half
     // reads on its own, the other half goes on to the colour path
-    let known = block_tag.iter().filter(|&&t| t != TAG_UNKNOWN).count();
+    let known = block_tag.iter().filter(|&&t| tag_known(t)).count();
     if precheck && n_lv == 2 && known * 10 >= nblocks * 9 {
         let white = super::read::white_of(pal) as usize;
         // every pilot sampled at its block's shift, and the levels of its block's neighbourhood (lighting changes
@@ -1213,7 +1247,7 @@ fn read_cells_luma_from(y: &GrayImage, grid: &FlatGrid, h: &Homography, tag_hint
         let pv: Vec<Option<f32>> = par_map(pilots.len(), |i| { let p = &pilots[i]; let (dx, dy) = shift[p.block]; at(p.cx + dx, p.cy + dy) });
         let blv = block_levels(&pv);
         let xs: Vec<Option<f32>> = pilots.iter().zip(&pv).map(|(p, v)| {
-            if block_tag[p.block] == TAG_UNKNOWN { return None; }
+            if !tag_known(block_tag[p.block]) { return None; }
             let v = (*v)?;
             let l = blv[p.block];
             let span = l[white] - l[1 - white];
@@ -1283,6 +1317,7 @@ fn read_cells_luma_from(y: &GrayImage, grid: &FlatGrid, h: &Homography, tag_hint
         out
     });
     let raw: Vec<f32> = if parts.len() == 1 { parts.into_iter().next().unwrap() } else { parts.concat() };
+    mark_flat_blocks(&mut block_tag, &raw, cols, rows, bw);
     let raw_at = |c: u32, r: u32| -> Option<f32> { let v = raw[(r * cols + c) as usize]; if v.is_nan() { None } else { Some(v) } };
     let pilot_v: Vec<Option<f32>> = par_map(pilots.len(), |i| raw_at(pilots[i].col, pilots[i].row));
     let block_lv: Vec<Lv> = block_levels(&pilot_v);
@@ -1368,7 +1403,7 @@ fn read_cells_luma_from(y: &GrayImage, grid: &FlatGrid, h: &Homography, tag_hint
         // sources), without it 98.2-100% of codewords and 0.21-0.28% cells wrong, with it 100% and 0.05-0.08%
         if fmt.pitch >= 2 {
             // the pilots' values where their block's tag is known
-            let known: Vec<(usize, Option<bool>)> = pilots.iter().map(|p| ((p.row * cols + p.col) as usize, (block_tag[p.block] != TAG_UNKNOWN).then_some(p.colour == white))).collect();
+            let known: Vec<(usize, Option<bool>)> = pilots.iter().map(|p| ((p.row * cols + p.col) as usize, tag_known(block_tag[p.block]).then_some(p.colour == white))).collect();
             equalise_bw(grid, &raw, &known, white, lv[1] - lv[0], &mut values, &mut margins);
             mark("equalise");
         }
@@ -1453,7 +1488,7 @@ fn read_cells_luma_from(y: &GrayImage, grid: &FlatGrid, h: &Homography, tag_hint
             let mut acc = vec![[(0f64, 0u32); 8]; n_class];
             for (i, p) in pilots.iter().enumerate() {
                 let (Some(v), k) = (pilot_eq[i], p.colour as usize) else { continue };
-                if k >= n_lv || block_tag[p.block] == TAG_UNKNOWN { continue; }
+                if k >= n_lv || !tag_known(block_tag[p.block]) { continue; }
                 let e = &mut acc[class_of(p.col, p.row).min(n_class - 1)][k];
                 e.0 += (v - block_lv[p.block][k]) as f64; e.1 += 1;
             }

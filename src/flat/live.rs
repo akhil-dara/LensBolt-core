@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 pub fn decode_capture(dec: &FlatDecoder, img: &RgbImage, hint: Option<&FlatHint>) -> Result<Vec<FlatRead>, DecodeError> {
     let frs = match (hint, dec.decode_tracked(img, hint)) {
         (Some(_), Ok(fr)) => {
-            let mut tags: Vec<u8> = fr.reads.block_tag.clone(); tags.sort_unstable(); tags.dedup();
+            // two frame tags: a straddled capture (unknown and flat blocks are no frame's)
+            let mut tags: Vec<u8> = fr.reads.block_tag.iter().copied().filter(|&t| super::read::tag_known(t)).collect(); tags.sort_unstable(); tags.dedup();
             let mut frs = vec![fr];
             if tags.len() > 1 {
                 let (chrome, h) = (*frs[0].grid.chrome(), frs[0].homography);

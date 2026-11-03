@@ -85,6 +85,12 @@ impl Default for ReadParams {
 }
 /// `FlatReads::block_tag` value of a block whose pilots fit no frame tag.
 pub const TAG_UNKNOWN: u8 = 255;
+/// A block whose cells barely spread (a covered patch: a notification over the sender, a thumb; or blown out):
+/// unreadable, unlike `TAG_UNKNOWN` (its cells may still read: grey frames show some on clean captures). Its
+/// cells are erasures; the stitcher leaves them missing for a later capture.
+pub const TAG_FLAT: u8 = 254;
+/// Whether `t` is a frame tag (0..4), not `TAG_UNKNOWN` or `TAG_FLAT`.
+pub fn tag_known(t: u8) -> bool { t < 4 }
 impl ReadParams {
     /// The reader settings measured best for a cell pitch on real phone captures (2026-10-27, OnePlus 12 at
     /// 2.2-2.5 camera px per screen px): 1 px cells want a finer alignment step (sampling / 8), wider pooling
