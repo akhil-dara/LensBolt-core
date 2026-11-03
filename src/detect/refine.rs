@@ -141,16 +141,34 @@ fn bright_centroid(gray: &GrayImage, cx: f32, cy: f32, r: f32, thr: u8) -> Optio
     Some((mx, my))
 }
 
-/// Whether border cell `i` (a white one) shows this grid's local pattern through `h`: its black neighbour
-/// must be clearly darker. Where the border belongs to another frame (a rolling-shutter split across grids)
-/// or to clutter, it usually is not, and the point is left out of the fit.
-fn pattern_ok(gray: &GrayImage, grid: &impl TimingBorder, h: &Homography, i: u32) -> bool {
+/// The step a border's white cell must stand above its black neighbour by, for the steps `diffs` (white minus
+/// black) seen in one capture: `STEP_SHARE` of their median size, between `STEP_MIN` and `STEP_MAX` levels. A
+/// normal screen's step is 100+ levels and gets the full `STEP_MAX` (20, the fixed margin before); a dim or
+/// washed-out one (black and white 20 levels apart: a panel at low brightness, glare lifting the blacks) failed
+/// every check with a fixed 20 and read nothing although its cells read whole, and gets a margin scaled to its
+/// own contrast. A wrong geometry's steps come in either sign: the share above the margin stays low.
+pub fn step_margin(diffs: &mut [f32]) -> f32 {
+    if diffs.is_empty() { return STEP_MAX; }
+    for d in diffs.iter_mut() { *d = d.abs(); }
+    let mid = diffs.len() / 2;
+    let (_, med, _) = diffs.select_nth_unstable_by(mid, f32::total_cmp);
+    (STEP_SHARE * *med).clamp(STEP_MIN, STEP_MAX)
+}
+/// `step_margin`'s share of the median step, and its bounds in grey levels: the floor stays clear of a camera's
+/// noise (+-2-4 levels), the ceiling is the fixed margin every screen used before.
+const STEP_SHARE: f32 = 0.4;
+const STEP_MIN: f32 = 6.0;
+const STEP_MAX: f32 = 20.0;
+
+/// White minus black for border cell `i` (a white one) and its black neighbour through `h`; None when either
+/// is out of view.
+fn border_step(gray: &GrayImage, grid: &impl TimingBorder, h: &Homography, i: u32) -> Option<f32> {
     let n = grid.border_count();
     let j = if !grid.border_is_white((i + 1) % n) { (i + 1) % n } else { (i + n - 1) % n };
     let centre = |k: u32| { let (x, y) = grid.border_center(k); h.apply(x, y) };
     let ((wx, wy), (bx, by)) = (centre(i), centre(j));
     let inside = |x: f32, y: f32| x >= 1.0 && y >= 1.0 && x < gray.width as f32 - 2.0 && y < gray.height as f32 - 2.0;
-    inside(wx, wy) && inside(bx, by) && gray.sample(wx - 0.5, wy - 0.5) > gray.sample(bx - 0.5, by - 0.5) + 20.0
+    (inside(wx, wy) && inside(bx, by)).then(|| gray.sample(wx - 0.5, wy - 0.5) - gray.sample(bx - 0.5, by - 0.5))
 }
 
 /// Fit (homography or affine) with outlier trimming: points that disagree with the fit by more than
@@ -190,11 +208,15 @@ pub fn refine_homography(gray: &GrayImage, grid: &impl TimingBorder, h: &Homogra
         if !(1.0..=200.0).contains(&cam_pitch) { return cur; }
         let r = (cam_pitch * 0.55).clamp(1.5, 64.0);
         let mut pairs: Vec<((f32, f32), (f32, f32))> = Vec::new();
-        for i in 0..grid.border_count() {
-            if !grid.border_is_white(i) { continue; }
+        // a white border cell counts when it shows this grid's local pattern: its black neighbour clearly darker,
+        // by a margin scaled to this capture's contrast. Where the border belongs to another frame (a
+        // rolling-shutter split across grids) or to clutter, it usually is not, and the point stays out of the fit.
+        let steps: Vec<(u32, f32)> = (0..grid.border_count()).filter(|&i| grid.border_is_white(i)).filter_map(|i| border_step(gray, grid, &cur, i).map(|d| (i, d))).collect();
+        let margin = step_margin(&mut steps.iter().map(|s| s.1).collect::<Vec<_>>());
+        for &(i, step) in &steps {
             let centre = grid.border_center(i);
             let (px, py) = cur.apply(centre.0, centre.1);
-            if !pattern_ok(gray, grid, &cur, i) { continue; }
+            if step <= margin { continue; }
             if let Some(m) = bright_centroid(gray, px, py, r, thr) { pairs.push((centre, m)); }
         }
         if pairs.len() < 16 { return cur; }

@@ -201,17 +201,63 @@ pub fn find_marker_candidates_r(gray: &GrayImage, radius: usize) -> Vec<(f32, f3
 }
 
 pub fn find_markers(gray: &GrayImage) -> Option<MarkerSet> {
-    let clusters = find_marker_candidates(gray);
+    let mut clusters = find_marker_candidates(gray);
+    clusters.sort_by(|a, b| b.3.cmp(&a.3));
     let pts: Vec<(f32, f32)> = clusters.iter().filter(|c| c.3 >= 2).map(|c| (c.0, c.1)).collect();
-    if pts.len() < 4 { return None; }
-    let pick = |f: &dyn Fn(&(f32, f32)) -> f32| *pts.iter().max_by(|a, b| f(a).partial_cmp(&f(b)).unwrap()).unwrap();
-    let tl = pick(&|p| -(p.0 + p.1));
-    let tr = pick(&|p| p.0 - p.1);
-    let br = pick(&|p| p.0 + p.1);
-    let bl = pick(&|p| p.1 - p.0);
-    let set = [tl, tr, br, bl];
-    for i in 0..4 { for j in i + 1..4 { if set[i] == set[j] { return None; } } }
-    Some(MarkerSet { tl, tr, br, bl })
+    corner_set(&pts)
+}
+
+/// Candidates a corner search weighs at most (the strongest first): C(12, 4) = 495 quadrilaterals.
+const CORNER_CANDIDATES: usize = 12;
+
+/// The four tile corners among marker candidate points, strongest first (only the first `CORNER_CANDIDATES` count):
+/// the four that span the largest convex quadrilateral, clockwise on screen (y down) from the one at the smallest
+/// angle about their centre, so an upright tile comes out top-left, top-right, bottom-right, bottom-left. Which
+/// corner is which is the callers' business (they try the four cyclic orders). Unlike the extremes of x + y and
+/// x - y, this does not depend on the tile's roll: rolled 45 degrees its corners tie on both diagonals and those
+/// extremes picked one marker twice (every capture of a diagonally held phone read nothing). The largest
+/// quadrilateral has its corners on the points' convex hull, so only the hull's points are tried (a hull of h
+/// points: C(h, 4) quadrilaterals, already in order; 12 points cost a few microseconds).
+pub fn corner_set(pts: &[(f32, f32)]) -> Option<MarkerSet> {
+    let pts = &pts[..pts.len().min(CORNER_CANDIDATES)];
+    let hull = convex_hull_cw(pts);
+    let h = hull.len();
+    if h < 4 { return None; }
+    let area = |q: &[(f32, f32); 4]| (0..4).map(|i| q[i].0 * q[(i + 1) % 4].1 - q[(i + 1) % 4].0 * q[i].1).sum::<f32>() / 2.0;
+    let mut best: Option<(f32, [(f32, f32); 4])> = None;
+    for a in 0..h { for b in a + 1..h { for c in b + 1..h { for d in c + 1..h {
+        let q = [hull[a], hull[b], hull[c], hull[d]];
+        let s = area(&q);
+        if best.is_none_or(|(m, _)| s > m) { best = Some((s, q)); }
+    } } } }
+    let (s, mut q) = best?;
+    if s <= 0.0 { return None; }
+    // start at the smallest angle about the quadrilateral's centre (the top-left of an upright tile)
+    let (cx, cy) = (q.iter().map(|p| p.0).sum::<f32>() / 4.0, q.iter().map(|p| p.1).sum::<f32>() / 4.0);
+    let first = (0..4).min_by(|&i, &j| (q[i].1 - cy).atan2(q[i].0 - cx).total_cmp(&(q[j].1 - cy).atan2(q[j].0 - cx))).unwrap();
+    q.rotate_left(first);
+    Some(MarkerSet { tl: q[0], tr: q[1], br: q[2], bl: q[3] })
+}
+
+/// The convex hull of `pts`, clockwise on screen (y down; counter-clockwise in y-up terms), collinear points
+/// dropped (Andrew's monotone chain).
+fn convex_hull_cw(pts: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let mut p: Vec<(f32, f32)> = pts.to_vec();
+    p.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    p.dedup();
+    if p.len() < 3 { return p; }
+    let cross = |o: (f32, f32), a: (f32, f32), b: (f32, f32)| (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0);
+    let mut hull: Vec<(f32, f32)> = Vec::with_capacity(2 * p.len());
+    for pass in 0..2 {
+        let start = hull.len();
+        let iter: Box<dyn Iterator<Item = &(f32, f32)>> = if pass == 0 { Box::new(p.iter()) } else { Box::new(p.iter().rev()) };
+        for &q in iter {
+            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], q) <= 0.0 { hull.pop(); }
+            hull.push(q);
+        }
+        hull.pop();
+    }
+    hull
 }
 
 #[cfg(test)]
@@ -231,6 +277,20 @@ pub(crate) mod tests {
                 assert!(d < 2.0, "{fmt:?} {w}x{h} marker {i}: found {f:?} expected {e:?} (d={d:.2})");
             }
         }
+    }
+    #[test]
+    fn corner_set_ignores_roll() {
+        for deg in [0.0f32, 30.0, 45.0, 60.0, 90.0, 135.0, 180.0, -45.0] {
+            let a = deg.to_radians();
+            let sq = [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, y)| (500.0 + 300.0 * (x * a.cos() - y * a.sin()), 400.0 + 300.0 * (x * a.sin() + y * a.cos())));
+            // the markers among weaker inner clusters (data cells imitating a marker), strongest first
+            let pts = [sq[2], sq[0], sq[3], sq[1], (520.0, 410.0), (430.0, 380.0), (600.0, 450.0)];
+            let m = corner_set(&pts).unwrap_or_else(|| panic!("roll {deg}: no corners"));
+            let got = m.as_array();
+            let k = (0..4).find(|&k| got[0] == sq[k]).unwrap_or_else(|| panic!("roll {deg}: {got:?}"));
+            for i in 0..4 { assert_eq!(got[i], sq[(k + i) % 4], "roll {deg}: clockwise order"); }
+        }
+        assert!(corner_set(&[(0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (30.0, 0.0)]).is_none(), "collinear points are no tile");
     }
     #[test]
     fn blank_image_has_no_markers() {

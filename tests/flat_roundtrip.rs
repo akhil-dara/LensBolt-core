@@ -88,6 +88,44 @@ fn rotated_90_capture_decodes() {
     assert!(fp.bytes == payload, "payload differs");
 }
 
+/// A phone held diagonally: the tile rolled 30-60 degrees in the frame (at 45 its corners are the frame's top,
+/// right, bottom and left, and no corner is the extreme of x + y or x - y on its own).
+#[test]
+fn diagonal_rolls_decode() {
+    for (k, yaw) in [30.0f32, 40.0, 45.0, 50.0, 60.0, -45.0, 135.0].into_iter().enumerate() {
+        let (_, f, payload) = frame(CellFormat { pitch: 3, alphabet: Alphabet::Bw }, 10 + k as u32);
+        let cam = synth(&render(&f), 1920, 1440, 1024.0 * 0.9, yaw, 1.0, 4, 20 + k as u64);
+        let read = FlatDecoder::new().decode(&cam).unwrap_or_else(|e| panic!("roll {yaw}: {e:?}"));
+        assert_eq!(read.header, f.header, "roll {yaw}");
+        let fp = read.payload();
+        assert_eq!(fp.codewords_failed, 0, "roll {yaw}");
+        assert!(fp.bytes == payload, "roll {yaw}: payload differs");
+    }
+}
+
+/// A dim or washed-out screen: black and white only 20 camera levels apart (a panel at low brightness in a dark
+/// room, or glare lifting the blacks), with sensor noise. The cells read; the geometry's border checks must not
+/// demand a fixed 20-level step.
+#[test]
+fn low_contrast_screen_decodes() {
+    for (k, (lo, hi)) in [(90u8, 110u8), (30, 50), (180, 200)].into_iter().enumerate() {
+        let (g, f, payload) = frame(CellFormat { pitch: 3, alphabet: Alphabet::Bw }, 30 + k as u32);
+        let mut cam = synth(&render(&f), 1920, 1440, 1024.0 * 1.2, 4.0, 1.0, 0, 40 + k as u64);
+        let mut st = 77u64 + k as u64;
+        for p in cam.data.iter_mut() {
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+            let n = (st % 5) as f32 - 2.0;
+            *p = (lo as f32 + *p as f32 / 255.0 * (hi - lo) as f32 + n).round().clamp(0.0, 255.0) as u8;
+        }
+        let read = FlatDecoder::new().decode(&cam).unwrap_or_else(|e| panic!("levels {lo}-{hi}: {e:?}"));
+        let fp = read.payload();
+        assert_eq!(fp.codewords_failed, 0, "levels {lo}-{hi}: {}/{} codewords", fp.codewords_ok, g.codewords());
+        assert!(fp.bytes == payload, "levels {lo}-{hi}: payload differs");
+        let luma = FlatDecoder::new().decode_luma(&cam.to_gray(), None).unwrap_or_else(|e| panic!("levels {lo}-{hi} luma: {e:?}"));
+        assert_eq!(luma[0].payload().codewords_failed, 0, "levels {lo}-{hi}: the luma path");
+    }
+}
+
 #[test]
 fn wide_tile_1024x768_decodes() {
     let fmt = CellFormat { pitch: 4, alphabet: Alphabet::C8 };

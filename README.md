@@ -46,7 +46,7 @@ A 12 px colour manifest frame is shown every 31 frames so a receiver can join la
 
 ```toml
 [dependencies]
-lensbolt-core = { git = "https://github.com/akhil-dara/lensbolt-core", tag = "v0.1.0", default-features = false }
+lensbolt-core = { git = "https://github.com/akhil-dara/lensbolt-core", tag = "v0.1.1", default-features = false }
 ```
 
 Features: `zstd` (compression through the C library; on by default, off for WebAssembly where files are sent as
@@ -112,3 +112,7 @@ Issues and ideas: the tracker of whichever repository they belong to.
 
 LensBolt is free software under the [GNU AGPL-3.0](LICENSE). If it helps you, you can support the work:
 [Buy me a coffee](https://buymeacoffee.com/akhildara1l) · [GitHub Sponsors](https://github.com/sponsors/akhil-dara).
+
+The project lives in three repositories: [lensbolt-core](https://github.com/akhil-dara/lensbolt-core) (the codec and
+decoder, Rust), [lensbolt-web](https://github.com/akhil-dara/lensbolt-web) (the sender and receiver pages and the
+site, lensbolt.com) and [lensbolt-android](https://github.com/akhil-dara/lensbolt-android) (the Android receiver).

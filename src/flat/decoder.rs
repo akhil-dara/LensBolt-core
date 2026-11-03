@@ -72,25 +72,27 @@ fn now_ms() -> f64 {
 }
 
 /// Fraction of the (up to 14) white border modules nearest `anchor` that are clearly brighter than the
-/// black module next to them through `h`; 0 if fewer than 6 are in view. Rejects wrong size/rotation
+/// black module next to them through `h` (by `step_margin` of their steps); None if fewer than 6 are in view. Rejects wrong size/rotation
 /// candidates for a few pixel reads.
 fn probe_score(gray: &GrayImage, chrome: &Chrome, h: &Homography, anchor: (f32, f32)) -> Option<f32> {
     let n = chrome.border_count();
     let mut cand: Vec<(f32, u32)> = (0..n).filter(|&i| chrome.border_is_white(i) && !chrome.border_is_white((i + 1) % n))
         .map(|i| { let c = chrome.border_center(i); ((c.0 - anchor.0).hypot(c.1 - anchor.1), i) }).collect();
     cand.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    let (mut seen, mut good) = (0, 0);
+    let mut steps: Vec<f32> = Vec::with_capacity(14);
     for &(_, i) in cand.iter().take(40) {
         let (w, b) = (chrome.border_center(i), chrome.border_center((i + 1) % n));
         let ((wx, wy), (bx, by)) = (h.apply(w.0, w.1), h.apply(b.0, b.1));
         let inside = |x: f32, y: f32| x >= 1.0 && y >= 1.0 && x < gray.width as f32 - 2.0 && y < gray.height as f32 - 2.0;
         if !inside(wx, wy) || !inside(bx, by) { continue; }
-        seen += 1;
-        if gray.sample(wx - 0.5, wy - 0.5) > gray.sample(bx - 0.5, by - 0.5) + 20.0 { good += 1; }
-        if seen == 14 { break; }
+        steps.push(gray.sample(wx - 0.5, wy - 0.5) - gray.sample(bx - 0.5, by - 0.5));
+        if steps.len() == 14 { break; }
     }
     // a marker whose border runs off the image (the tile touching the frame edge) cannot vote
-    if seen < 6 { None } else { Some(good as f32 / seen as f32) }
+    if steps.len() < 6 { return None; }
+    // clearly brighter: by a margin scaled to this capture's contrast (a dim screen's step is a few levels)
+    let margin = crate::detect::refine::step_margin(&mut steps.clone());
+    Some(steps.iter().filter(|&&d| d > margin).count() as f32 / steps.len() as f32)
 }
 
 /// The four corner markers among the candidate clusters. The 7-module markers with a 3-module centre
@@ -102,11 +104,7 @@ fn pick_markers(gray: &GrayImage) -> Option<MarkerSet> {
     if cands.len() < 4 { return None; }
     let floor = (cands[3].3 / 2).max(2);
     let pts: Vec<(f32, f32)> = cands.iter().filter(|c| c.3 >= floor).map(|c| (c.0, c.1)).collect();
-    if pts.len() < 4 { return None; }
-    let pick = |f: &dyn Fn(&(f32, f32)) -> f32| *pts.iter().max_by(|a, b| f(a).partial_cmp(&f(b)).unwrap()).unwrap();
-    let set = [pick(&|p| -(p.0 + p.1)), pick(&|p| p.0 - p.1), pick(&|p| p.0 + p.1), pick(&|p| p.1 - p.0)];
-    for i in 0..4 { for j in i + 1..4 { if set[i] == set[j] { return None; } } }
-    Some(MarkerSet { tl: set[0], tr: set[1], br: set[2], bl: set[3] })
+    crate::detect::markers::corner_set(&pts)
 }
 
 impl FlatDecoder {
