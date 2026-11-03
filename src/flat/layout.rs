@@ -116,6 +116,8 @@ pub struct FlatGrid {
     kinds: std::sync::OnceLock<Vec<u8>>,
     /// the fast reader's equaliser roles of a read with every cell read (`eq_roles`), built on first use
     eq_roles: std::sync::OnceLock<(Vec<u8>, Vec<u8>)>,
+    /// `data_indices`, built on first use
+    data_index: std::sync::OnceLock<Vec<u32>>,
 }
 
 /// `FlatGrid::cell_kinds`: a cell that is neither data nor a pilot (a marker zone)...
@@ -182,7 +184,7 @@ impl FlatGrid {
         // packet is not a format
         let codewords = data_positions.len() * k.bits() as usize / 8 / 255;
         if codewords * format.data_len() < crate::packet::PACKET_BYTES { return None; }
-        Some(FlatGrid { chrome, format, cols, rows, origin_x, origin_y, cells, data_positions, pilot_positions, data_cells, regions, codewords, kinds: std::sync::OnceLock::new(), eq_roles: std::sync::OnceLock::new() })
+        Some(FlatGrid { chrome, format, cols, rows, origin_x, origin_y, cells, data_positions, pilot_positions, data_cells, regions, codewords, kinds: std::sync::OnceLock::new(), eq_roles: std::sync::OnceLock::new(), data_index: std::sync::OnceLock::new() })
     }
     /// Every cell's kind (`CELL_NONE`, `CELL_DATA`, `CELL_PAST`, `CELL_PILOT`), row-major, built once per grid
     /// (the reads of a shared grid do not walk its cell map).
@@ -210,6 +212,11 @@ impl FlatGrid {
     /// Data cells the codeword stream fills (the rest are 0).
     pub fn used_data_cells(&self) -> usize { (self.codewords * 255 * 8).div_ceil(self.format.alphabet.bits() as usize) }
     pub fn data_position(&self, index: u32) -> (u32, u32) { self.data_positions[index as usize] }
+    /// Every data cell's row-major index (`row * cols + col`), in data order: the sender places a frame's cells
+    /// with one lookup each. Built on first use (the grid is shared across frames).
+    pub fn data_indices(&self) -> &[u32] {
+        self.data_index.get_or_init(|| self.data_positions.iter().map(|&(c, r)| r * self.cols + c).collect())
+    }
     pub fn pilot_positions(&self) -> &[(u32, u32)] { &self.pilot_positions }
     /// Pilot colours cycle through the alphabet so that neighbouring pilots differ and every colour is
     /// sampled across the frame.

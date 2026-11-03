@@ -46,7 +46,7 @@ A 12 px colour manifest frame is shown every 31 frames so a receiver can join la
 
 ```toml
 [dependencies]
-lensbolt-core = { git = "https://github.com/akhil-dara/lensbolt-core", tag = "v0.1.2", default-features = false }
+lensbolt-core = { git = "https://github.com/akhil-dara/lensbolt-core", tag = "v0.1.3", default-features = false }
 ```
 
 Features: `zstd` (compression through the C library; on by default, off for WebAssembly where files are sent as

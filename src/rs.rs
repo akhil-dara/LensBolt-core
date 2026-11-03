@@ -9,7 +9,11 @@ pub const SAFETY_MARGIN: usize = 2;
 
 /// `synd_mul[j][v]` = v · α^j: the syndromes are Horner evaluations at fixed roots, one table lookup per
 /// symbol instead of a general multiply (a clean codeword costs its syndromes and nothing else).
-pub struct RsCodec { parity: usize, gen: Vec<u8>, synd_mul: Vec<[u8; 256]> }
+/// `enc_rows`, built on the first `encode` (decoders never need it): row `f` holds the generator's parity
+/// coefficients times `f`, so each data byte of the long division XORs one row of `parity` bytes into the
+/// remainder (contiguous, vectorised) instead of making `parity` general multiplies. A 1 px frame (64 parity
+/// bytes over about 520 codewords) spent 6.5 of its 11 ms here.
+pub struct RsCodec { parity: usize, gen: Vec<u8>, synd_mul: Vec<[u8; 256]>, enc_rows: std::sync::OnceLock<Vec<u8>> }
 
 impl RsCodec {
     pub fn new(parity: usize) -> RsCodec {
@@ -17,21 +21,27 @@ impl RsCodec {
         let mut gen = vec![1u8];
         for i in 0..parity { gen = gf::poly_mul(&gen, &[gf::exp(i), 1]); }
         let synd_mul = (0..parity).map(|j| { let x = gf::exp(j); std::array::from_fn(|v| gf::mul(v as u8, x)) }).collect();
-        RsCodec { parity, gen, synd_mul }
+        RsCodec { parity, gen, synd_mul, enc_rows: std::sync::OnceLock::new() }
     }
     pub fn parity(&self) -> usize { self.parity }
 
     pub fn encode(&self, data: &[u8]) -> Vec<u8> {
         assert!(data.len() + self.parity <= 255);
+        let p = self.parity;
+        // row f, entry j-1: gen[glen-1-j] * f for j in 1..glen (glen = p + 1), the long division's update of
+        // the remainder at offsets 1..=p for feedback f
+        let rows = self.enc_rows.get_or_init(|| {
+            let mut t = vec![0u8; 256 * p];
+            for f in 1..256usize { for j in 1..=p { t[f * p + j - 1] = gf::mul(self.gen[p - j], f as u8); } }
+            t
+        });
         let mut out = data.to_vec();
-        out.extend(std::iter::repeat(0u8).take(self.parity));
-        let glen = self.gen.len();
+        out.resize(data.len() + p, 0);
         for i in 0..data.len() {
-            let coef = out[i];
-            if coef == 0 { continue; }
-            for j in 1..glen {
-                out[i + j] ^= gf::mul(self.gen[glen - 1 - j], coef);
-            }
+            let f = out[i] as usize;
+            if f == 0 { continue; }
+            let row = &rows[f * p..(f + 1) * p];
+            for (o, r) in out[i + 1..i + 1 + p].iter_mut().zip(row) { *o ^= r; }
         }
         let mut cw = data.to_vec();
         cw.extend_from_slice(&out[data.len()..]);
@@ -203,6 +213,39 @@ fn berlekamp_massey(s: &[u8], max_len: usize) -> (Vec<u8>, usize) {
 mod tests {
     use super::*;
     fn sample(n: usize) -> Vec<u8> { (0..n).map(|i| (i * 7 + 3) as u8).collect() }
+
+    /// The long division one general multiply at a time (the encoder before its row table): the reference the
+    /// table encoder must match byte for byte.
+    fn encode_reference(rs: &RsCodec, data: &[u8]) -> Vec<u8> {
+        let mut out = data.to_vec();
+        out.extend(std::iter::repeat(0u8).take(rs.parity));
+        let glen = rs.gen.len();
+        for i in 0..data.len() {
+            let coef = out[i];
+            if coef == 0 { continue; }
+            for j in 1..glen { out[i + j] ^= gf::mul(rs.gen[glen - 1 - j], coef); }
+        }
+        let mut cw = data.to_vec();
+        cw.extend_from_slice(&out[data.len()..]);
+        cw
+    }
+
+    #[test]
+    fn table_encoder_matches_the_long_division() {
+        // every parity a format uses (24, 32, 40, 64 for 1 px, 16 in the header) and the extremes, data of
+        // every length up to the full word, pseudo-random and all-zero and all-0xff bytes
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        for parity in [2usize, 16, 24, 32, 40, 64, 128] {
+            let rs = RsCodec::new(parity);
+            for len in [1usize, 2, 17, 100, 255 - parity] {
+                if len + parity > 255 { continue; }
+                let random: Vec<u8> = (0..len).map(|_| { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st as u8 }).collect();
+                for data in [random, vec![0u8; len], vec![0xffu8; len]] {
+                    assert_eq!(rs.encode(&data), encode_reference(&rs, &data), "parity {parity}, {len} bytes");
+                }
+            }
+        }
+    }
 
     #[test]
     fn encode_then_clean_decode_is_identity() {

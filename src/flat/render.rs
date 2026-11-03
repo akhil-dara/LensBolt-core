@@ -37,17 +37,36 @@ pub fn render(frame: &FlatFrame) -> RgbImage {
     let mut img = RgbImage::new(g.width_px(), g.height_px());
     render_chrome(&mut img, g.chrome(), &frame.header.to_bits());
     let pal = g.format().alphabet.palette();
-    let p = g.format().pitch as u32;
+    let p = g.format().pitch as usize;
     let used = g.used_data_cells() as u32;
+    let (w, h, cols) = (img.width as usize, img.height as usize, g.cols() as usize);
+    // each cell's p x p pixels written straight into the rows (a 1 px frame's million cells spent 3.8 ms in
+    // a bounds-checked pixel at a time)
     for r in 0..g.rows() {
+        let y0 = g.cell_top_left(0, r).1 as usize;
+        let ys = y0..(y0 + p).min(h);
         for c in 0..g.cols() {
             // unused cells and data cells beyond the last stripe stay black: no false colour samples
             match g.cell(c, r) { FlatCell::Unused => continue, FlatCell::Data { index } if index >= used => continue, _ => {} }
-            let (x, y) = g.cell_top_left(c, r);
-            img.fill_rect(x, y, p, p, pal[frame.value(c, r) as usize]);
+            let x0 = g.cell_top_left(c, r).0 as usize;
+            if x0 >= w { continue; }
+            let span = ((x0 + p).min(w) - x0) * 3;
+            let rgb = pal[frame.values[r as usize * cols + c as usize] as usize];
+            for y in ys.clone() {
+                let o = (y * w + x0) * 3;
+                for px in img.data[o..o + span].chunks_exact_mut(3) { px.copy_from_slice(&rgb); }
+            }
         }
     }
     img
+}
+
+/// `render_to` as RGBA bytes (`width * height * 4`, opaque), what a browser's `ImageData` takes.
+pub fn render_rgba(frame: &FlatFrame, width: u32, height: u32) -> Vec<u8> {
+    let img = render_to(frame, width, height);
+    let mut out = vec![255u8; img.data.len() / 3 * 4];
+    for (o, i) in out.chunks_exact_mut(4).zip(img.data.chunks_exact(3)) { o[..3].copy_from_slice(i); }
+    out
 }
 
 /// `render` scaled to (width, height) with nearest-neighbour sampling (integer factors keep cells crisp).
@@ -73,6 +92,46 @@ mod tests {
     use crate::header::FrameType;
     use crate::flat::FlatHeader;
     use std::sync::Arc;
+
+    /// `render` as it was (each cell through fill_rect): the reference the direct writes must match.
+    fn render_reference(frame: &FlatFrame) -> RgbImage {
+        let g = &frame.grid;
+        let mut img = RgbImage::new(g.width_px(), g.height_px());
+        render_chrome(&mut img, g.chrome(), &frame.header.to_bits());
+        let pal = g.format().alphabet.palette();
+        let p = g.format().pitch as u32;
+        let used = g.used_data_cells() as u32;
+        for r in 0..g.rows() { for c in 0..g.cols() {
+            match g.cell(c, r) { FlatCell::Unused => continue, FlatCell::Data { index } if index >= used => continue, _ => {} }
+            let (x, y) = g.cell_top_left(c, r);
+            img.fill_rect(x, y, p, p, pal[frame.value(c, r) as usize]);
+        } }
+        img
+    }
+
+    #[test]
+    fn render_matches_the_reference_for_every_format() {
+        for alphabet in Alphabet::ALL {
+            for pitch in [1u8, 2, 3, 4, 12] {
+                for (w, h) in [(1024u32, 1024u32), (1024, 768)] {
+                    let fmt = CellFormat { pitch, alphabet };
+                    let Some(g) = FlatGrid::try_new(w, h, fmt) else { continue };
+                    let g = Arc::new(g);
+                    let hdr = FlatHeader { format: fmt, cols: g.cols() as u16, rows: g.rows() as u16, frame_type: FrameType::Data, transfer_id: 3, segment: 1, block_id: 9, frame_seq: 6 };
+                    let payload: Vec<u8> = (0..g.payload_bytes()).map(|i| ((i as u64).wrapping_mul(2654435761) >> 9) as u8).collect();
+                    let f = compose(g, hdr, &payload);
+                    let (a, b) = (render(&f), render_reference(&f));
+                    assert!(a.data == b.data, "{fmt:?} {w}x{h}");
+                    let rgba = render_rgba(&f, w, h);
+                    assert!(rgba.chunks_exact(4).zip(a.data.chunks_exact(3)).all(|(o, i)| o[..3] == *i && o[3] == 255), "{fmt:?} {w}x{h}: rgba");
+                    // a scaled tile (the sender's Retina scale) through the same path
+                    let big = render_rgba(&f, w * 2, h * 2);
+                    let up = render_to(&f, w * 2, h * 2);
+                    assert!(big.chunks_exact(4).zip(up.data.chunks_exact(3)).all(|(o, i)| o[..3] == *i && o[3] == 255), "{fmt:?} {w}x{h}: rgba at 2x");
+                }
+            }
+        }
+    }
 
     #[test]
     fn render_size_and_chrome() {

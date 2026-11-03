@@ -59,12 +59,21 @@ pub fn frame_stream(grid: &FlatGrid, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn compose(grid: Arc<FlatGrid>, header: FlatHeader, payload: &[u8]) -> FlatFrame {
-    let cells = stripe_cells(&frame_stream(&grid, payload), grid.format().alphabet.bits());
-    debug_assert_eq!(cells.len(), grid.used_data_cells());
+    let stream = frame_stream(&grid, payload);
+    let bits = grid.format().alphabet.bits();
+    let idx = &grid.data_indices()[..grid.used_data_cells()];
     let mut values = vec![0u8; (grid.cols() * grid.rows()) as usize];
-    for (i, &v) in cells.iter().enumerate() {
-        let (c, r) = grid.data_position(i as u32);
-        values[(r * grid.cols() + c) as usize] = v;
+    if 8 % bits == 0 {
+        // 1, 2 or 4 bits a cell: each stream byte unpacks straight into its cells' places (a 1 px frame's
+        // million cells spent 2.8 ms striped into a list and then placed one position lookup at a time)
+        let (per, mask) = ((8 / bits) as usize, (1u8 << bits) - 1);
+        for (chunk, &b) in idx.chunks(per).zip(&stream) {
+            for (s, &i) in chunk.iter().enumerate() { values[i as usize] = (b >> (8 - bits as usize * (s + 1))) & mask; }
+        }
+    } else {
+        let cells = stripe_cells(&stream, bits);
+        debug_assert_eq!(cells.len(), idx.len());
+        for (&i, &v) in idx.iter().zip(&cells) { values[i as usize] = v; }
     }
     let tag = header.frame_seq & 3;
     for &(c, r) in grid.pilot_positions() {
@@ -93,6 +102,30 @@ mod tests {
             assert_eq!(cells_to_stripe(&cells, bits), bytes);
         }
         assert_eq!(stripe_cells(&[0b1011_0001], 3), vec![0b101, 0b100, 0b01 << 1]); // 8 bits -> 2 full cells + 2 bits padded with a zero
+    }
+    /// compose as it was: striped cells placed one data position at a time (the reference the fused unpacking
+    /// must match cell for cell)
+    fn compose_reference(grid: &FlatGrid, header: FlatHeader, payload: &[u8]) -> Vec<u8> {
+        let cells = stripe_cells(&frame_stream(grid, payload), grid.format().alphabet.bits());
+        let mut values = vec![0u8; (grid.cols() * grid.rows()) as usize];
+        for (i, &v) in cells.iter().enumerate() { let (c, r) = grid.data_position(i as u32); values[(r * grid.cols() + c) as usize] = v; }
+        let tag = header.frame_seq & 3;
+        for &(c, r) in grid.pilot_positions() { if let FlatCell::Pilot { .. } = grid.cell(c, r) { values[(r * grid.cols() + c) as usize] = grid.pilot_colour_at(c, r, tag); } }
+        values
+    }
+    #[test]
+    fn compose_matches_the_reference_for_every_alphabet() {
+        for alphabet in Alphabet::ALL {
+            for pitch in [1u8, 2, 3, 4] {
+                let fmt = CellFormat { pitch, alphabet };
+                let Some(g) = FlatGrid::try_new(1024, 1024, fmt) else { continue };
+                let g = Arc::new(g);
+                let payload: Vec<u8> = (0..g.payload_bytes()).map(|i| ((i as u64).wrapping_mul(2654435761) >> 11) as u8).collect();
+                let mut h = hdr(&g);
+                h.frame_seq = 5;
+                assert!(compose(g.clone(), h, &payload).values == compose_reference(&g, h, &payload), "{fmt:?}");
+            }
+        }
     }
     #[test]
     fn compose_places_header_pilots_and_data() {

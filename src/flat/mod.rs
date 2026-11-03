@@ -22,7 +22,7 @@ pub use format::{Alphabet, CellFormat, MANIFEST_FORMAT, MODULE_PX, PITCHES};
 pub use layout::{Chrome, FlatCell, FlatGrid};
 pub use header::{FlatHeader, HeaderCopy, FLAT_HEADER_BYTES, FLAT_HEADER_RS_PARITY, FLAT_VERSION};
 pub use compose::{compose, cells_to_stripe, frame_stream, stripe_cells, FlatFrame};
-pub use render::{render, render_to};
+pub use render::{render, render_rgba, render_to};
 pub use colour::ColourModel;
 pub use read::{read_cells, read_header, read_header_bits, sampling, FlatReads, ReadParams};
 pub use extract::{extract_cells, extract_payload, FramePayload, ERASURE_MARGIN};
