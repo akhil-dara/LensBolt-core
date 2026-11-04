@@ -22,6 +22,17 @@ pub fn erasure_margin() -> u16 { let o = ERASURE_MARGIN_OVERRIDE.load(std::sync:
 /// spent on erasures RS would accept anything.
 pub const SPARE_PARITY: usize = 8;
 
+/// A b/w cell read white counts this much weaker when its byte's erasure rank is set. On screens black cells read
+/// white far more often than the reverse, and with margins that look safe: on real phone captures (a laptop's 2
+/// px tile, a phone sender's 3 px) 7-11x as many black cells read white as white read black, and of the white reads
+/// with margins up to 4096, 8192 and 16384, 88%, 76% and 43% were wrong, against 6%, 3% and 0.7% of black reads;
+/// the erasure margin flagged only 5-9% of the wrong cells (screens glow into their dark cells; ink, the
+/// reverse). Ranked this way, real 2 px captures degraded to their floor read more codewords: 1.2 px 55.7 ->
+/// 64.1% cold, 82.9 -> 88.4% tracked; 1.4 px out of focus 84.8 -> 89.4% cold; no frame read wrong. Flat from 8
+/// to 128; the erasure count and the spare parity are unchanged.
+pub const WHITE_DISTRUST: u16 = 1 << WHITE_DISTRUST_SHIFT;
+const WHITE_DISTRUST_SHIFT: u32 = 5;
+
 pub fn extract_payload(reads: &FlatReads, grid: &FlatGrid) -> FramePayload {
     // a read the blend pre-check stopped before its cells: every cell missing
     if reads.values.is_empty() {
@@ -48,6 +59,7 @@ pub fn extract_cells(grid: &FlatGrid, values: &[u8], margins: &[u16], present: O
     let t0 = std::env::var_os("LB_PROFILE").map(|_| std::time::Instant::now());
     let mark = |what: &str| { if let Some(t0) = t0 { eprintln!("  [extract] {:>7.1} ms  {}", t0.elapsed().as_secs_f64() * 1000.0, what); } };
     let bits = fmt.alphabet.bits() as usize;
+    let white_shift = if bits == 1 { WHITE_DISTRUST_SHIFT } else { 0 };
     let (parity, data_len, n) = (fmt.parity(), fmt.data_len(), grid.codewords());
     let used = grid.used_data_cells();
     let stream_len = n * 255;
@@ -64,8 +76,11 @@ pub fn extract_cells(grid: &FlatGrid, values: &[u8], margins: &[u16], present: O
         let here = present.map_or(true, |p| p[idx]);
         if here { seen += 1; }
         let (b0, b1) = ((i * bits) / 8, ((i + 1) * bits - 1) / 8);
+        // b/w: a cell read white is far less sure than its margin says (WHITE_DISTRUST); branchless (black and
+        // white cells come at random: a branch here cost 5 ms of an 11 ms 1 px frame)
+        let m = margins[idx] >> (white_shift * (values[idx] as u32 & 1));
         for b in b0..=b1.min(stream_len - 1) {
-            if here { weak[b] = weak[b].min(margins[idx]); } else { missing[b] = true; }
+            if here { weak[b] = weak[b].min(m); } else { missing[b] = true; }
         }
     }
     mark("cells gathered");
@@ -159,6 +174,30 @@ mod tests {
         assert_eq!(fp.codewords_failed, 0, "ok={} failed={}", fp.codewords_ok, fp.codewords_failed);
         assert_eq!(fp.bytes, payload);
     }
+    // black cells read white with margins that pass as sure (the screen-capture error, WHITE_DISTRUST): about
+    // 12 wrong bytes a codeword, about what RS mends alone, decode once the white reads rank as erasures (with
+    // the white reads ranked like the black: 54 of 111 codewords)
+    #[test]
+    fn black_cells_read_white_rank_as_erasures() {
+        let fmt = CellFormat { pitch: 2, alphabet: Alphabet::Bw };
+        let g = Arc::new(FlatGrid::try_new(1024, 1024, fmt).unwrap());
+        let h = FlatHeader { format: fmt, cols: g.cols() as u16, rows: g.rows() as u16, frame_type: FrameType::Data, transfer_id: 1, segment: 1, block_id: 0, frame_seq: 0 };
+        let payload: Vec<u8> = (0..g.payload_bytes()).map(|i| (i * 31 + 7) as u8).collect();
+        let mut values = compose(g.clone(), h, &payload).values;
+        let mut margins = vec![60000u16; values.len()];
+        let mut st = 0x2545_F491u32;
+        for i in 0..g.used_data_cells() as u32 {
+            let (c, r) = g.data_position(i);
+            let idx = (r * g.cols() + c) as usize;
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            // 1.2% of the black data cells read white with a margin of 8000 (sure-looking, under the white reads' usual)
+            if values[idx] == 0 && st % 1000 < 12 { values[idx] = 1; margins[idx] = 8000; }
+        }
+        let p = extract_cells(&g, &values, &margins, None, None);
+        assert!(p.codewords_ok * 100 >= g.codewords() * 90, "{} of {} codewords", p.codewords_ok, g.codewords());
+        assert!(p.bytes.iter().zip(&payload).zip(&p.valid).all(|((a, b), &v)| !v || a == b), "a byte marked valid is wrong");
+    }
+
     #[test]
     fn missing_cells_are_erasures() {
         // half the frame unseen: every codeword has ~half its bytes missing, beyond parity, so nothing is

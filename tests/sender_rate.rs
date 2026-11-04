@@ -227,7 +227,7 @@ fn live_status_carries_the_sender_rate() {
     for i in 0..60u32 {
         let img = render(&s.next_frame().unwrap());
         if let Some(wait) = (base + period * i).checked_duration_since(Instant::now()) { std::thread::sleep(wait); }
-        if live.has_room() && live.submit_capture(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)) }) { accepted += 1; }
+        if live.has_room() && live.submit_capture(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)), origin: (0, 0) }) { accepted += 1; }
     }
     let t0 = Instant::now();
     let st = loop {
@@ -400,7 +400,7 @@ fn live_rate_falls_to_zero_while_nothing_decodes() {
     for i in 0..60u32 {
         let img = render(&s.next_frame().unwrap());
         if let Some(wait) = (base + period * i).checked_duration_since(Instant::now()) { std::thread::sleep(wait); }
-        if live.has_room() && live.submit_capture(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)) }) { accepted += 1; }
+        if live.has_room() && live.submit_capture(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)), origin: (0, 0) }) { accepted += 1; }
     }
     let st = settle(accepted);
     assert!((st.sender_fps - 30.0).abs() <= 3.0, "before: {st:?}");
@@ -410,7 +410,7 @@ fn live_rate_falls_to_zero_while_nothing_decodes() {
         if let Some(wait) = (base + period * i).checked_duration_since(Instant::now()) { std::thread::sleep(wait); }
         let at = Instant::now().saturating_duration_since(away).as_secs_f64() * 1000.0;
         let img = blank();
-        if live.has_room() && live.submit_capture(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)) }) { accepted += 1; }
+        if live.has_room() && live.submit_capture(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)), origin: (0, 0) }) { accepted += 1; }
         let st = settle(accepted);
         if st.sender_fps == 0.0 && zero_by.is_none() { zero_by = Some(at); }
         if at >= 2100.0 { assert_eq!(st.sender_fps, 0.0, "{at:.0} ms of failed captures: {st:?}"); }

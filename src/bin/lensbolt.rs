@@ -297,7 +297,7 @@ fn recv(out: &Path, threads: usize, bgr: bool, no_drop: bool, calibrate: bool, c
                     // why: blur, no markers, or markers without a readable header
                     let gray = img.to_gray();
                     let strong = lensbolt_core::detect::find_marker_candidates(&gray).iter().filter(|c| c.3 >= 4).count();
-                    let kind = match e { DecodeError::TooBlurry(_) => "TooBlurry", DecodeError::NoMarkers => "NoMarkers", DecodeError::NoHeader => "NoHeader", DecodeError::OtherVersion(_) => "OtherVersion", DecodeError::NeedsColour(_) => "NeedsColour" };
+                    let kind = match e { DecodeError::TooBlurry(_) => "TooBlurry", DecodeError::NoMarkers => "NoMarkers", DecodeError::NoHeader => "NoHeader", DecodeError::OtherVersion(_) => "OtherVersion", DecodeError::NeedsColour(..) => "NeedsColour" };
                     let _ = tx.send((seq, None, t.elapsed().as_secs_f64() * 1000.0, Some((kind.to_string(), lensbolt_core::detect::sharpness(&gray), strong))));
                 }
             }

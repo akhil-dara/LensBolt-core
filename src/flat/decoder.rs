@@ -16,8 +16,12 @@ pub enum DecodeError { TooBlurry(f32), NoMarkers, NoHeader,
     /// differ (format 9: the repair packets of small chunks).
     OtherVersion(u8),
     /// The luma path found a frame of a colour alphabet (the 12 px c8 manifest, colour data): read it with
-    /// the RGB path (`decode_capture`).
-    NeedsColour(FlatHeader) }
+    /// the RGB path. With where it found it (`ColourAt`): the RGB read starts there (`decode_luma_first`).
+    NeedsColour(FlatHeader, Option<Box<ColourAt>>) }
+
+/// Where the luma path found a colour frame: its chrome, geometry and both header copies.
+#[derive(Debug, PartialEq)]
+pub struct ColourAt { pub chrome: Chrome, pub homography: Homography, pub headers: [Option<FlatHeader>; 2] }
 
 /// Tile widths and heights a sender may draw (every pair with a chrome is tried; the standard tile first).
 pub const FRAME_WIDTHS: [u32; 6] = [1024, 1280, 1536, 1920, 2048, 2560];
@@ -54,7 +58,10 @@ pub struct FlatDecoder { pub sizes: Vec<(u32, u32)>, pub min_sharpness: f32, pub
     /// tracked reads left without the alignment check's re-read, after two re-reads in a row that lost (the check
     /// fired on something the field was not to blame for: glare, a finger): `REREAD_BACKOFF` captures; and the
     /// re-reads lost in a row so far
-    reread_backoff: AtomicU32, rereads_lost: AtomicU32 }
+    reread_backoff: AtomicU32, rereads_lost: AtomicU32,
+    /// cold identifications run so far (the full marker search: the costly path; `cold_identifications`), and
+    /// tracked captures in a row whose header failed under a geometry that checked out
+    cold_ids: AtomicU32, tracked_misses: AtomicU32 }
 
 /// Captures a tracked read goes without the re-read from scratch after two in a row that lost. One lost re-read
 /// is not enough: a capture whose bottom shows the manifest loses its re-read, and the next capture needs one
@@ -99,19 +106,83 @@ fn probe_score(gray: &GrayImage, chrome: &Chrome, h: &Homography, anchor: (f32, 
 /// give many hit rows (about 3 per module of size), while random data cells imitate the run pattern
 /// only on a couple of rows, so only clusters near the strongest ones compete for the corners.
 fn pick_markers(gray: &GrayImage) -> Option<MarkerSet> {
-    let mut cands = find_marker_candidates(gray);
+    pick_from(&strongest_first(gray, None)).or_else(|| pick_from(&strongest_first(gray, Some(FINE_RADIUS))))
+}
+/// The binarisation radius of the second marker search (camera px), for a small tile lit on a dark screen (a
+/// phone sender): the frame's window (1/16 of the frame, 90 px at 1440x1080) is mostly dark screen at the
+/// tile's corners, its mean about that of the marker's blurred 1-module ring, so the ring reads white and no
+/// marker is found (60 of 60 captures of a phone sender, `tests/phone_sender_tile.rs`). A window of a couple of
+/// modules at 2 camera px per cell sees the ring against its own whites. Only when the frame's window finds
+/// nothing: a big marker's 3-module centre is wider than this window and breaks up in it.
+const FINE_RADIUS: usize = 12;
+/// Frames of this many px and more look for markers on a half-size copy first (`identify_core`).
+const COARSE_FROM_PX: u64 = 4_000_000;
+/// `gray` at half the width and height, each pixel the mean of its 2 x 2 (candidate coordinates and units in it
+/// are half those of `gray`: pixel i's centre i + 0.5 is 2i + 1 in `gray`).
+fn half_size(gray: &GrayImage) -> GrayImage {
+    let (w, h) = (gray.width / 2, gray.height / 2);
+    let mut out = GrayImage::new(w, h);
+    let src = gray.width as usize;
+    crate::par::par_chunks_rows(&mut out.data, w as usize, |y, line| {
+        let (a, b) = (&gray.data[2 * y * src..], &gray.data[(2 * y + 1) * src..]);
+        for (x, o) in line.iter_mut().enumerate() { *o = ((a[2 * x] as u16 + a[2 * x + 1] as u16 + b[2 * x] as u16 + b[2 * x + 1] as u16 + 2) / 4) as u8; }
+    });
+    out
+}
+/// The marker candidates of `gray` (x, y, unit, hits), the strongest first: the frame's binarisation window, or
+/// the one of `radius`.
+fn strongest_first(gray: &GrayImage, radius: Option<usize>) -> Vec<(f32, f32, f32, u32)> {
+    let mut cands = match radius { None => find_marker_candidates(gray), Some(r) => crate::detect::markers::find_marker_candidates_r(gray, r) };
     cands.sort_by(|a, b| b.3.cmp(&a.3));
+    cands
+}
+/// `pick_markers` from candidates already found (strongest first).
+fn pick_from(cands: &[(f32, f32, f32, u32)]) -> Option<MarkerSet> {
     if cands.len() < 4 { return None; }
     let floor = (cands[3].3 / 2).max(2);
     let pts: Vec<(f32, f32)> = cands.iter().filter(|c| c.3 >= floor).map(|c| (c.0, c.1)).collect();
     crate::detect::markers::corner_set(&pts)
 }
 
+/// What the candidates tried so far showed: one passed the border probe; a whole header of another version.
+#[derive(Default)]
+struct Seen { probed: bool, other: Option<u8> }
+
+/// Candidates a three-marker search weighs (the strongest clusters).
+const THREE_MARKER_CANDIDATES: usize = 4;
+
+/// Corner sets from three markers, for a tile whose fourth corner is out of the picture or covered: from the
+/// strongest candidate clusters, every three that span a triangle, each corner of it taken in turn as the one
+/// between the other two (the parallelogram's fourth point completes it: a + c - b), clockwise, with which
+/// corners were found. The geometry from a completed corner is a guess the border's fit corrects.
+fn three_marker_sets(cands: &[(f32, f32, f32, u32)]) -> Vec<([(f32, f32); 4], [bool; 4])> {
+    // markers give many hit rows; data cells imitating one give a couple
+    let pts: Vec<(f32, f32)> = cands.iter().take(THREE_MARKER_CANDIDATES).filter(|c| c.3 >= 4).map(|c| (c.0, c.1)).collect();
+    let mut out = Vec::new();
+    let n = pts.len();
+    for i in 0..n { for j in i + 1..n { for k in j + 1..n {
+        let tri = [pts[i], pts[j], pts[k]];
+        let area = ((tri[1].0 - tri[0].0) * (tri[2].1 - tri[0].1) - (tri[2].0 - tri[0].0) * (tri[1].1 - tri[0].1)).abs() / 2.0;
+        let side = (0..3).map(|q| { let (a, b) = (tri[q], tri[(q + 1) % 3]); (a.0 - b.0).hypot(a.1 - b.1) }).fold(0f32, f32::max);
+        if area < 0.2 * side * side { continue; } // nearly collinear: no tile
+        for b in 0..3 {
+            let (a, c, mid) = (tri[(b + 1) % 3], tri[(b + 2) % 3], tri[b]);
+            let fourth = (a.0 + c.0 - mid.0, a.1 + c.1 - mid.1);
+            let Some(set) = crate::detect::markers::corner_set(&[a, mid, c, fourth]) else { continue };
+            let m = set.as_array();
+            out.push((m, m.map(|p| p != fourth)));
+        }
+    } } }
+    out
+}
+
 impl FlatDecoder {
     pub fn new() -> FlatDecoder {
         let sizes = all_sizes().into_iter().filter(|&(w, h)| Chrome::new(w, h).is_some()).collect();
-        FlatDecoder { sizes, min_sharpness: 4.0, params: ReadParams::default(), gate_score: AtomicU32::new(0), reread_backoff: AtomicU32::new(0), rereads_lost: AtomicU32::new(0) }
+        FlatDecoder { sizes, min_sharpness: 4.0, params: ReadParams::default(), gate_score: AtomicU32::new(0), reread_backoff: AtomicU32::new(0), rereads_lost: AtomicU32::new(0), cold_ids: AtomicU32::new(0), tracked_misses: AtomicU32::new(0) }
     }
+    /// Cold identifications (full marker searches) run so far.
+    pub fn cold_identifications(&self) -> u32 { self.cold_ids.load(Ordering::Relaxed) }
     /// The first stage of every decode: `TooBlurry` for a frame below `min_sharpness`, else the global
     /// two-means threshold the geometry binarises with. Both from a sparse sample of a large frame
     /// (`gate_sharpness`, `two_means_threshold_sampled`); the full-frame score decides a borderline frame,
@@ -135,33 +206,60 @@ impl FlatDecoder {
     }
     /// The first (size x rotation) candidate with a header of this version. None: `OtherVersion` when a candidate
     /// read a whole header of another version, else `NoHeader` when one passed the border probe, else `NoMarkers`.
+    /// The four corner markers first; when they give nothing, three markers (`three_marker_sets`): a corner out of
+    /// the picture or covered.
     fn identify_core(&self, gray: &GrayImage, thr: u8, read_hdr: &dyn Fn(&Chrome, &Homography) -> [HeaderCopy; 2]) -> Result<(Chrome, Homography, [Option<FlatHeader>; 2]), DecodeError> {
-        let Some(markers) = pick_markers(gray) else { return Err(DecodeError::NoMarkers) };
-        let m = markers.as_array();
-        let rotations = [[m[0], m[1], m[2], m[3]], [m[1], m[2], m[3], m[0]], [m[2], m[3], m[0], m[1]], [m[3], m[0], m[1], m[2]]];
+        self.cold_ids.fetch_add(1, Ordering::Relaxed);
+        let mut seen = Seen::default();
+        // a large frame (a full-sensor stream) looks on a half-size copy first: the marker search binarises and
+        // scans every pixel (58 of the 85 ms of a 12 MP cold decode), and markers of 8 tile px modules stay
+        // several px wide when halved; the full size is searched only when the copy finds nothing that reads
+        let small = (gray.width as u64 * gray.height as u64 >= COARSE_FROM_PX).then(|| half_size(gray));
+        let searches: Vec<(&GrayImage, f32, Option<usize>)> = match &small {
+            Some(sm) => vec![(sm, 2.0, None), (sm, 2.0, Some(FINE_RADIUS)), (gray, 1.0, None), (gray, 1.0, Some(FINE_RADIUS))],
+            None => vec![(gray, 1.0, None), (gray, 1.0, Some(FINE_RADIUS))],
+        };
+        // the frame's binarisation window, then a small one (FINE_RADIUS: a phone sender's tile on a dark screen)
+        for (img, scale, radius) in searches {
+            let cands: Vec<(f32, f32, f32, u32)> = strongest_first(img, radius).into_iter().map(|c| (c.0 * scale, c.1 * scale, c.2 * scale, c.3)).collect();
+            if let Some(markers) = pick_from(&cands) {
+                if let Some(r) = self.identify_from(gray, thr, markers.as_array(), [true; 4], read_hdr, &mut seen) { return Ok(r); }
+            }
+            for (m, real) in three_marker_sets(&cands) {
+                if let Some(r) = self.identify_from(gray, thr, m, real, read_hdr, &mut seen) { return Ok(r); }
+            }
+        }
+        Err(match (seen.other, seen.probed) { (Some(v), _) => DecodeError::OtherVersion(v), (None, true) => DecodeError::NoHeader, (None, false) => DecodeError::NoMarkers })
+    }
+    /// Every (size x rotation) candidate for corner points `m` (clockwise) of which `real[i]` were found (not
+    /// completed): the border probe and the refinement use the real ones only, so a completed corner (a guess,
+    /// out of the picture or under a thumb) neither vetoes a candidate nor pulls the fit.
+    fn identify_from(&self, gray: &GrayImage, thr: u8, m: [(f32, f32); 4], real: [bool; 4], read_hdr: &dyn Fn(&Chrome, &Homography) -> [HeaderCopy; 2], seen: &mut Seen) -> Option<(Chrome, Homography, [Option<FlatHeader>; 2])> {
+        let rot = |k: usize| -> ([(f32, f32); 4], [bool; 4]) { (std::array::from_fn(|i| m[(i + k) % 4]), std::array::from_fn(|i| real[(i + k) % 4])) };
         let dbg = std::env::var("LB_DEBUG").is_ok();
-        if dbg { eprintln!("flat identify: markers {:?}", m); }
-        let (mut best_probe, mut other) = (None, None);
+        if dbg { eprintln!("flat identify: markers {m:?} (found {real:?})"); }
         for &(w, h) in &self.sizes {
             let Some(chrome) = Chrome::new(w, h) else { continue };
-            for rot in &rotations {
-                let Some(coarse) = Homography::from_points(chrome.marker_centers(), *rot) else { continue };
-                // every marker whose border is in view must show the timing pattern, and at least two must be
-                let scores: Vec<f32> = chrome.marker_centers().iter().filter_map(|&p| probe_score(gray, &chrome, &coarse, p)).collect();
+            for k in 0..4 {
+                let (pts, found) = rot(k);
+                let Some(coarse) = Homography::from_points(chrome.marker_centers(), pts) else { continue };
+                // every found marker whose border is in view must show the timing pattern, and at least two must be
+                let scores: Vec<f32> = chrome.marker_centers().iter().zip(found).filter(|(_, f)| *f).filter_map(|(&p, _)| probe_score(gray, &chrome, &coarse, p)).collect();
                 let score = scores.iter().copied().fold(1.0f32, f32::min);
-                if dbg { eprintln!("  size {w}x{h} rot {:?}: probe {score:.2} over {} markers", rot[0], scores.len()); }
+                if dbg { eprintln!("  size {w}x{h} rot {:?}: probe {score:.2} over {} markers", pts[0], scores.len()); }
                 if scores.len() < 2 || score < 0.64 { continue; }
-                let pairs: Vec<_> = chrome.marker_centers().iter().zip(rot.iter()).map(|(a, b)| (*a, *b)).collect();
-                let refined = refine_homography(gray, &chrome, &coarse, &pairs, thr);
+                let pairs: Vec<_> = chrome.marker_centers().iter().zip(pts.iter()).zip(found).filter(|(_, f)| *f).map(|((a, b), _)| (*a, *b)).collect();
+                // a completed corner starts far off: the border's fit grows out from the found markers
+                let refined = if found.iter().all(|&f| f) { refine_homography(gray, &chrome, &coarse, &pairs, thr) } else { crate::detect::refine::refine_homography_grow(gray, &chrome, &coarse, &pairs, thr) };
                 let copies = read_hdr(&chrome, &refined);
                 let headers = copies.map(HeaderCopy::header);
                 if dbg { eprintln!("    headers {copies:?}"); }
-                if headers.iter().any(|h| h.is_some()) { return Ok((chrome, refined, headers)); }
-                if best_probe.is_none() { best_probe = Some(()); }
-                if other.is_none() { other = copies.iter().find_map(|c| c.other_version()); }
+                if headers.iter().any(|h| h.is_some()) { return Some((chrome, refined, headers)); }
+                seen.probed = true;
+                if seen.other.is_none() { seen.other = copies.iter().find_map(|c| c.other_version()); }
             }
         }
-        Err(match (other, best_probe) { (Some(v), _) => DecodeError::OtherVersion(v), (None, Some(())) => DecodeError::NoHeader, (None, None) => DecodeError::NoMarkers })
+        None
     }
     fn read_with(&self, img: &RgbImage, chrome: &Chrome, h: &Homography, header: FlatHeader, t0: f64) -> Result<FlatRead, DecodeError> {
         let grid = FlatGrid::shared(chrome.width_px(), chrome.height_px(), header.format).ok_or(DecodeError::NoHeader)?;
@@ -209,9 +307,10 @@ impl FlatDecoder {
             let (w, h) = (x1 - x0, y1 - y0);
             let mut win = GrayImage::new(w, h);
             for yy in 0..h { let o = ((y0 + yy) * gray.width + x0) as usize; win.data[(yy * w) as usize..((yy + 1) * w) as usize].copy_from_slice(&gray.data[o..o + w as usize]); }
-            let cands = crate::detect::markers::find_marker_candidates_r(&win, (gray.width.max(gray.height) as usize / 16).max(8));
-            let best = cands.into_iter().max_by_key(|c| c.3)?;
-            if best.3 < 4 { return None; }
+            // the frame's binarisation window, then one of two marker modules (FINE_RADIUS: a tile on a dark screen)
+            let strongest = |r: usize| crate::detect::markers::find_marker_candidates_r(&win, r).into_iter().max_by_key(|c| c.3).filter(|c| c.3 >= 4);
+            let best = strongest((gray.width.max(gray.height) as usize / 16).max(8))
+                .or_else(|| strongest(((2.0 * MODULE_PX as f32 * scale).round() as usize).max(8)))?;
             out[k] = (best.0 + x0 as f32, best.1 + y0 as f32);
         }
         Some(out)
@@ -241,16 +340,41 @@ impl FlatDecoder {
             let h = refine_homography(y, &chrome, &coarse, &pairs, thr);
             mark("  refine homography");
             let headers = rd(&chrome, &h).map(HeaderCopy::header);
-            if headers.iter().any(|x| x.is_some()) { Some((chrome, h, headers)) } else { None }
+            // markers where the hint put them and the border checked out: the tile is not lost, so an unreadable
+            // header is a damaged one (a capture taken while the sender changed frames: 14 of 60 phone
+            // captures). A cold search would find this geometry again and fail the same way, at 85 ms against
+            // 31 ms for a read (4 threads)
+            if headers.iter().any(|x| x.is_some()) { return Some(Ok((chrome, h, headers))); }
+            // the fit through all four can miss the header where a fit from three reads it (a centre found a
+            // little off: 4 of 60 phone captures read only through a cold search's three-marker fit): each
+            // marker left out in turn, its corner completed (a + c - b) and the border grown from the others
+            for k in 0..4 {
+                let (a, b, c) = (m[(k + 1) % 4], m[(k + 2) % 4], m[(k + 3) % 4]);
+                let mut m3 = m;
+                m3[k] = (a.0 + c.0 - b.0, a.1 + c.1 - b.1);
+                let Some(coarse) = Homography::from_points(chrome.marker_centers(), m3) else { continue };
+                let pairs3: Vec<_> = pairs.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, p)| *p).collect();
+                let h3 = crate::detect::refine::refine_homography_grow(y, &chrome, &coarse, &pairs3, thr);
+                let headers = rd(&chrome, &h3).map(HeaderCopy::header);
+                if headers.iter().any(|x| x.is_some()) { return Some(Ok((chrome, h3, headers))); }
+            }
+            Some(Err(DecodeError::NoHeader))
         });
-        mark(if tracked.is_some() { "tracked geometry" } else { "tracking skipped or failed" });
+        mark(if matches!(tracked, Some(Ok(_))) { "tracked geometry" } else { "tracking skipped or failed" });
+        // a tracked miss answers NoHeader at once, but a second in a row searches cold: one damaged capture
+        // comes between two good ones; misses in a row may be a tracked geometry gone wrong
+        let tracked = match tracked {
+            Some(Ok(t)) => { self.tracked_misses.store(0, Ordering::Relaxed); Some(t) }
+            Some(Err(e)) => { if self.tracked_misses.fetch_add(1, Ordering::Relaxed) == 0 { return Err(e); } self.tracked_misses.store(0, Ordering::Relaxed); None }
+            None => None,
+        };
         let (chrome, h, headers) = match tracked { Some(t) => t, None => self.identify_core(y, thr, &rd)? };
         mark("geometry + headers");
         let mut out: Vec<FlatRead> = Vec::new();
         for (i, hdr) in headers.into_iter().flatten().enumerate() {
             if out.iter().any(|r| r.header == hdr) { continue; }
             if !hdr.format.alphabet.is_luma() {
-                if i == 0 || out.is_empty() { return Err(DecodeError::NeedsColour(hdr)); }
+                if i == 0 || out.is_empty() { return Err(DecodeError::NeedsColour(hdr, Some(Box::new(ColourAt { chrome, homography: h, headers })))); }
                 continue;
             }
             if let Some(same) = out.iter().find(|r| r.header.format == hdr.format && (r.header.cols, r.header.rows) == (hdr.cols, hdr.rows)) {

@@ -1,4 +1,4 @@
-//! The "soft" captures of 2026-11-02 (`test/phone_fhd2px_soft/dump`: a OnePlus 12 at 1440x1080 filming a 1024
+//! The "soft" captures of 2026-11-02 (`test/phone_fhd2px_soft/dump`: a phone at 1440x1080 filming a 1024
 //! tile of 2 px b/w at 1.6-1.9 camera px per cell, sender 30 fps; 60 consecutive captures of a run that read 0-4
 //! of 111 codewords for 90 s). They are not soft: every capture but three holds two sender frames blended over
 //! the exposure, the header's frame from ~88% of the light at the top of the tile to ~6% at the bottom

@@ -196,34 +196,64 @@ fn fit_trimmed(points: &[((f32, f32), (f32, f32))], markers: &[((f32, f32), (f32
 /// Refine `h` (frame px -> camera px) using the border's white cells and the marker centres.
 /// `thr` is the binarisation threshold used for detection. Falls back to `h` if too few cells are found.
 pub fn refine_homography(gray: &GrayImage, grid: &impl TimingBorder, h: &Homography, markers: &[((f32, f32), (f32, f32))], thr: u8) -> Homography {
+    refine_homography_passes(gray, grid, h, markers, thr, 2)
+}
+/// `refine_homography` with `passes` rounds over the whole border.
+pub fn refine_homography_passes(gray: &GrayImage, grid: &impl TimingBorder, h: &Homography, markers: &[((f32, f32), (f32, f32))], thr: u8, passes: usize) -> Homography {
     let mut cur = *h;
+    for _ in 0..passes { match refine_pass(gray, grid, &cur, markers, thr, &|_| true) { Some(nh) => cur = nh, None => break } }
+    cur
+}
+
+/// Reaches, as shares of the tile's longer side, over which `refine_homography_grow` widens the border it fits.
+const GROW_REACH: [f32; 6] = [0.2, 0.32, 0.45, 0.6, 0.8, 1.1];
+
+/// The fit from three found markers and a completed fourth (a parallelogram's corner, a guess that ignores the
+/// perspective: 50 camera px off on a tile rolled 15 degrees with its corner out of the picture). Fitted over the
+/// whole border at once it does not come in: the cells far from the found markers are predicted too far off to
+/// match, so the fit learns only near the three corners and keeps the guessed perspective (5 px off even beside
+/// them, a header module, so no header read). Grown instead: the border near the found markers first, where the
+/// prediction holds, then wider, each fit predicting the next ring, then two rounds over everything in view.
+pub fn refine_homography_grow(gray: &GrayImage, grid: &impl TimingBorder, h: &Homography, markers: &[((f32, f32), (f32, f32))], thr: u8) -> Homography {
+    let (w_px, h_px) = grid.size_px();
+    let side = w_px.max(h_px) as f32;
+    let anchors: Vec<(f32, f32)> = markers.iter().map(|m| m.0).collect();
+    let mut cur = *h;
+    for share in GROW_REACH {
+        let reach = share * side;
+        let near = |c: (f32, f32)| anchors.iter().any(|a| (a.0 - c.0).hypot(a.1 - c.1) <= reach);
+        if let Some(nh) = refine_pass(gray, grid, &cur, markers, thr, &near) { cur = nh; }
+    }
+    refine_homography_passes(gray, grid, &cur, markers, thr, 2)
+}
+
+/// One round of the border's fit through `cur`, over the white border cells `near` accepts (tile px): None when
+/// the pitch is absurd (a wrong candidate) or too few cells match.
+fn refine_pass(gray: &GrayImage, grid: &impl TimingBorder, cur: &Homography, markers: &[((f32, f32), (f32, f32))], thr: u8, near: &dyn Fn((f32, f32)) -> bool) -> Option<Homography> {
     let pitch = grid.module_px();
     let (w_px, h_px) = grid.size_px();
-    for _pass in 0..2 {
-        // camera-space pitch near the frame centre
-        let (cx, cy) = (w_px as f32 / 2.0, h_px as f32 / 2.0);
-        let (ax, ay) = cur.apply(cx, cy); let (bx, by) = cur.apply(cx + pitch, cy);
-        let cam_pitch = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
-        // a wrong grid/rotation candidate can give an absurd pitch; refuse rather than scan huge windows
-        if !(1.0..=200.0).contains(&cam_pitch) { return cur; }
-        let r = (cam_pitch * 0.55).clamp(1.5, 64.0);
-        let mut pairs: Vec<((f32, f32), (f32, f32))> = Vec::new();
-        // a white border cell counts when it shows this grid's local pattern: its black neighbour clearly darker,
-        // by a margin scaled to this capture's contrast. Where the border belongs to another frame (a
-        // rolling-shutter split across grids) or to clutter, it usually is not, and the point stays out of the fit.
-        let steps: Vec<(u32, f32)> = (0..grid.border_count()).filter(|&i| grid.border_is_white(i)).filter_map(|i| border_step(gray, grid, &cur, i).map(|d| (i, d))).collect();
-        let margin = step_margin(&mut steps.iter().map(|s| s.1).collect::<Vec<_>>());
-        for &(i, step) in &steps {
-            let centre = grid.border_center(i);
-            let (px, py) = cur.apply(centre.0, centre.1);
-            if step <= margin { continue; }
-            if let Some(m) = bright_centroid(gray, px, py, r, thr) { pairs.push((centre, m)); }
-        }
-        if pairs.len() < 16 { return cur; }
-        // markers count several times (they are the most reliable points); outliers are trimmed
-        match fit_trimmed(&pairs, markers, true, (0.4 * cam_pitch).max(1.0)) { Some(nh) => cur = nh, None => return cur }
+    // camera-space pitch near the frame centre
+    let (cx, cy) = (w_px as f32 / 2.0, h_px as f32 / 2.0);
+    let (ax, ay) = cur.apply(cx, cy); let (bx, by) = cur.apply(cx + pitch, cy);
+    let cam_pitch = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
+    // a wrong grid/rotation candidate can give an absurd pitch; refuse rather than scan huge windows
+    if !(1.0..=200.0).contains(&cam_pitch) { return None; }
+    let r = (cam_pitch * 0.55).clamp(1.5, 64.0);
+    let mut pairs: Vec<((f32, f32), (f32, f32))> = Vec::new();
+    // a white border cell counts when it shows this grid's local pattern: its black neighbour clearly darker, by
+    // a margin scaled to this capture's contrast. Where the border belongs to another frame (a rolling-shutter
+    // split across grids) or to clutter, it usually is not, and the point stays out of the fit.
+    let steps: Vec<(u32, f32)> = (0..grid.border_count()).filter(|&i| grid.border_is_white(i) && near(grid.border_center(i))).filter_map(|i| border_step(gray, grid, cur, i).map(|d| (i, d))).collect();
+    let margin = step_margin(&mut steps.iter().map(|s| s.1).collect::<Vec<_>>());
+    for &(i, step) in &steps {
+        let centre = grid.border_center(i);
+        let (px, py) = cur.apply(centre.0, centre.1);
+        if step <= margin { continue; }
+        if let Some(m) = bright_centroid(gray, px, py, r, thr) { pairs.push((centre, m)); }
     }
-    cur
+    if pairs.len() < 16 { return None; }
+    // markers count several times (they are the most reliable points); outliers are trimmed
+    fit_trimmed(&pairs, markers, true, (0.4 * cam_pitch).max(1.0))
 }
 
 #[cfg(test)]

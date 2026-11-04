@@ -193,7 +193,30 @@ fn decoder<'a, R: Read + 'a>(src: &'a mut R, window_log: u32) -> io::Result<Box<
     { let _ = window_log; Ok(Box::new(ruzstd::StreamingDecoder::new(src).map_err(|e| io::Error::other(e.to_string()))?)) }
 }
 
+/// Copies `r` into `sink` until its end or until more than `cap` bytes came: false when it passed `cap` (it stops
+/// within one buffer of that). A transfer's file never unpacks past the size its manifest declares; a stream that
+/// would (a hostile sender's zip bomb: a few KB of zstd for gigabytes) is refused before it fills memory or storage.
+fn copy_capped(r: &mut dyn Read, cap: u64, mut sink: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<bool> {
+    let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 { return Ok(true); }
+        total += n as u64;
+        if total > cap { return Ok(false); }
+        sink(&buf[..n])?;
+    }
+}
+
+/// `decompress`, refused (an error) past `cap` bytes (`copy_capped`).
+fn decompress_capped(stream: &[u8], cap: u64) -> io::Result<Vec<u8>> {
+    let mut src = stream;
+    let mut out = Vec::new();
+    if copy_capped(&mut decoder(&mut src, 27)?, cap, |b| { out.extend_from_slice(b); Ok(()) })? { Ok(out) } else { Err(io::Error::other("unpacks past its declared size")) }
+}
+
 /// A whole zstd stream in memory: the zstd crate where it is built in, pure-Rust ruzstd otherwise (WebAssembly).
+#[allow(dead_code)]
 fn decompress(stream: &[u8]) -> io::Result<Vec<u8>> {
     #[cfg(feature = "zstd")]
     { zstd::stream::decode_all(stream) }
@@ -550,7 +573,8 @@ impl Receiver {
         };
         if let Some(Part::Mem(c)) = part {
             let stream = c.into_inner();
-            let data = if m.compressed { decompress(&stream)? } else { stream };
+            // past its declared size: refused like a file whose hash fails (copy_capped)
+            let data = if m.compressed { match decompress_capped(&stream, m.file_size) { Ok(d) => d, Err(_) => { self.t = None; return Ok(None); } } } else { stream };
             if <[u8; 32]>::from(Sha256::digest(&data)) != m.file_sha256 { self.t = None; return Ok(None); }
             self.taken = Some((m.filename.clone(), data));
             self.last_progress = self.progress();
@@ -567,13 +591,15 @@ impl Receiver {
                 let stores = self.stores.as_mut().unwrap();
                 let mut out = stores.create(&m.filename)?;
                 let mut at = 0u64;
-                {
+                let fits = {
                     let mut dec = decoder(&mut part, 27)?;
-                    loop { let n = dec.read(&mut buf)?; if n == 0 { break; } hasher.update(&buf[..n]); out.write_at(at, &buf[..n])?; at += n as u64; }
-                }
+                    copy_capped(&mut dec, m.file_size, |b| { hasher.update(b); out.write_at(at, b)?; at += b.len() as u64; Ok(()) })?
+                };
                 out.set_len(at)?;
                 drop(part);
                 stores.remove(&name);
+                // past its declared size: refused like a file whose hash fails
+                if !fits { drop(out); stores.remove(&m.filename); self.t = None; return Ok(None); }
                 m.filename.clone()
             } else {
                 loop { let n = part.read(&mut buf)?; if n == 0 { break; } hasher.update(&buf[..n]); }
@@ -596,9 +622,10 @@ impl Receiver {
             {
                 let mut dec = zstd::stream::Decoder::new(File::open(&part_path)?)?;
                 let mut out = io::BufWriter::new(File::create(&tmp)?);
-                let mut buf = vec![0u8; 1 << 20];
-                loop { let n = dec.read(&mut buf)?; if n == 0 { break; } hasher.update(&buf[..n]); out.write_all(&buf[..n])?; }
+                let fits = copy_capped(&mut dec, m.file_size, |b| { hasher.update(b); out.write_all(b) })?;
                 out.flush()?;
+                // past its declared size: refused like a file whose hash fails
+                if !fits { drop(out); let _ = std::fs::remove_file(&tmp); let _ = std::fs::remove_file(&part_path); self.t = None; return Ok(None); }
             }
             // verify before discarding the stream: a failure here means a bug, not a channel error
             if <[u8; 32]>::from(hasher.finalize()) != m.file_sha256 { let _ = std::fs::remove_file(&tmp); let _ = std::fs::remove_file(&part_path); self.t = None; return Ok(None); }
@@ -992,6 +1019,24 @@ fn remove_part(t: &mut Transfer, stores: Option<&mut Box<dyn StoreFactory>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // a stream that unpacks past the file size its manifest declares (a hostile sender's zip bomb: a few KB of
+    // zstd for gigabytes): the copy stops one byte past the size, never filling memory or storage first
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn unpacking_stops_past_the_declared_size() {
+        let big = vec![0u8; 8 << 20];
+        let stream = zstd::bulk::compress(&big, 19).unwrap();
+        assert!(stream.len() < 4096, "{}", stream.len());
+        let mut seen = 0u64;
+        let fits = copy_capped(&mut decoder(&mut &stream[..], 27).unwrap(), 1000, |b| { seen += b.len() as u64; Ok(()) }).unwrap();
+        assert!(!fits && seen <= 1 << 20, "stopped after {seen} bytes");
+        let mut all = 0u64;
+        assert!(copy_capped(&mut decoder(&mut &stream[..], 27).unwrap(), big.len() as u64, |b| { all += b.len() as u64; Ok(()) }).unwrap());
+        assert_eq!(all, big.len() as u64);
+        assert!(decompress_capped(&stream, 1000).is_err());
+        assert_eq!(decompress_capped(&stream, big.len() as u64).unwrap().len(), big.len());
+    }
     use crate::flat::{Alphabet, CellFormat, FlatSender, FlatSenderConfig};
     use crate::header::FrameType;
     fn dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {

@@ -62,7 +62,7 @@ fn status_answers_while_the_receiver_is_slow() {
             std::thread::sleep(Duration::from_millis(1));
         }
         if gate.inside.load(SeqCst) > 0 { break; }
-        offer(Box::new(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)) }));
+        offer(Box::new(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)), origin: (0, 0) }));
     }
     let (worst_status, worst_submit, overlapped) = std::thread::scope(|sc| {
         // a watchdog: if the probe is stuck behind the collector, let the disk go fast after 5 s so the test ends
@@ -82,7 +82,7 @@ fn status_answers_while_the_receiver_is_slow() {
             // a capture whose planes take a while to convert: the first few take the free workers, then
             // has_room is false and the rest are dropped; either way the call must return at once
             let t = Instant::now();
-            offer(Box::new(|| { std::thread::sleep(Duration::from_millis(50)); let g = GrayImage::new(64, 64); Capture { y: g, rgb: Some(Box::new(|| RgbImage::new(64, 64))) } }));
+            offer(Box::new(|| { std::thread::sleep(Duration::from_millis(50)); let g = GrayImage::new(64, 64); Capture { y: g, rgb: Some(Box::new(|| RgbImage::new(64, 64))), origin: (0, 0) } }));
             wc = wc.max(t.elapsed());
         }
         (ws, wc, gate.inside.load(SeqCst) > 0)

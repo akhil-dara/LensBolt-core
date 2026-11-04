@@ -218,7 +218,7 @@ fn live_receiver_reads_manifest_and_bw_data() {
         if st.complete.is_none() { progress_before_done = progress_before_done.max(st.received_bytes); }
         let cam = bend(&render(&s.next_frame().unwrap()), 1.5, n);
         let y = cam.to_gray();
-        let _ = live.submit_capture(move || Capture { y, rgb: Some(Box::new(move || cam)) });
+        let _ = live.submit_capture(move || Capture { y, rgb: Some(Box::new(move || cam)), origin: (0, 0) });
         n += 1;
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -251,7 +251,7 @@ fn codewords_follow_the_latest_capture_even_when_nothing_new_decodes() {
             std::thread::sleep(Duration::from_millis(1));
         }
     };
-    let offer = |cam: RgbImage| { let y = cam.to_gray(); assert!(live.submit_capture(move || Capture { y, rgb: Some(Box::new(move || cam)) })); };
+    let offer = |cam: RgbImage| { let y = cam.to_gray(); assert!(live.submit_capture(move || Capture { y, rgb: Some(Box::new(move || cam)), origin: (0, 0) })); };
     // the colour manifest, read in full
     let cfg = |pitch| FlatSenderConfig { manifest_every_frames: 10, transfer_id: 93, format: CellFormat { pitch, alphabet: Alphabet::Bw }, ..FlatSenderConfig::default() };
     let mut s = FlatSender::new(&src, cfg(1), Some(false)).unwrap();
@@ -365,4 +365,55 @@ fn try_batch_page_is_busy_while_a_feed_holds_the_receiver() {
     let page = page.unwrap();
     assert!(page.starts_with("{\"offset\":0,\"total\":3,\"files\":[{\"name\":\"doc-0.bin\""), "{page}");
     assert_eq!(page.matches("\"state\":\"received\"").count(), 3, "{page}");
+}
+
+/// A full-sensor stream (a phone sender's 2 px cells read only at the sensor's resolution): while the tile is
+/// tracked, only its region is copied (the receiver's `crop_rect`; a whole 12 MP plane costs 6 ms a capture on
+/// the camera's thread, the region under 1 ms), and the worker reads it with the hint moved into the crop. The
+/// tile jumps once mid-transfer, out of the crop: that capture fails, the next is copied whole and found again.
+#[test]
+fn live_receiver_reads_tracked_crops_of_a_large_frame() {
+    use lensbolt_core::detect::Homography;
+    use lensbolt_core::flat::live::Capture;
+    use lensbolt_core::flat::{Alphabet, CellFormat};
+    use lensbolt_core::image::GrayImage;
+    let src = tmp("live_crop.bin"); pseudo_random_file(&src, 600_000, 24).unwrap();
+    let out = tmp("live_crop_out"); let _ = std::fs::remove_dir_all(&out); std::fs::create_dir_all(&out).unwrap();
+    let cfg = FlatSenderConfig { manifest_every_frames: 10, transfer_id: 94, format: CellFormat { pitch: 3, alphabet: Alphabet::Bw }, ..FlatSenderConfig::default() };
+    let mut s = FlatSender::new(&src, cfg, Some(false)).unwrap();
+    let live = LiveReceiver::new(&out, LiveConfig { workers: 2 }).unwrap();
+    let (w, h) = (3000u32, 2250u32);
+    let place = |im: &RgbImage, cx: f32, cy: f32| -> RgbImage {
+        let s = 1200.0 / im.width as f32;
+        let src = [(0.0, 0.0), (im.width as f32, 0.0), (im.width as f32, im.height as f32), (0.0, im.height as f32)];
+        let dst = src.map(|p| (cx + s * (p.0 - im.width as f32 / 2.0), cy + s * (p.1 - im.height as f32 / 2.0)));
+        im.warp(&Homography::from_points(src, dst).unwrap().inverse().unwrap(), w, h)
+    };
+    let t0 = Instant::now();
+    let (mut n, mut cropped, mut whole) = (0u64, 0u64, 0u64);
+    while live.status().complete.is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(240), "no completion: {:?}", live.status());
+        // the tile jumps 700 px right after 30 captures
+        let cx = if n < 30 { 1100.0 } else { 1800.0 };
+        let cam = place(&render(&s.next_frame().unwrap()), cx, 1125.0);
+        let y = cam.to_gray();
+        let crop = if live.want_chroma() { None } else { live.crop_rect(w, h) };
+        let ok = match crop {
+            Some([x0, y0, x1, y1]) => {
+                let mut data = Vec::with_capacity(((x1 - x0) * (y1 - y0)) as usize);
+                for yy in y0..y1 { data.extend_from_slice(&y.data[(yy * w + x0) as usize..(yy * w + x1) as usize]); }
+                let c = GrayImage { width: x1 - x0, height: y1 - y0, data };
+                live.submit_capture(move || Capture { y: c, rgb: None, origin: (x0, y0) })
+            }
+            None => live.submit_capture(move || Capture { y, rgb: Some(Box::new(move || cam)), origin: (0, 0) }),
+        };
+        if ok { if crop.is_some() { cropped += 1 } else { whole += 1 } }
+        n += 1;
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let st = live.status();
+    assert!(std::fs::read(st.complete.as_ref().unwrap()).unwrap() == std::fs::read(&src).unwrap(), "output differs");
+    // whole: the start (no geometry yet), every 4th capture (its colour copy), the manifest's colour reads and the
+    // capture after the jump; the rest cropped (43 of 66 when written)
+    assert!(cropped > whole, "most captures cropped: {cropped} cropped, {whole} whole");
 }

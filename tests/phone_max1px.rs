@@ -1,7 +1,7 @@
 //! Time and correctness gate on real phone captures, through the phone's own path: the Y plane into
 //! `decode_luma_first` (RGB only for a colour frame), tracking from the previous decoded capture, then the
 //! capture's payload through a fresh `Stitcher`; one core, release, per capture the fastest of five passes.
-//! - 1px tier: a OnePlus 12 at Camera: Max (4096x3072 YUV_420_888) filming a 1024 tile of 1 px b/w
+//! - 1px tier: a phone at Camera: Max (4096x3072 YUV_420_888) filming a 1024 tile of 1 px b/w
 //!   (`test/phone_max1px_live/dump`, 8 captures in capture order).
 //! - Full HD 2px tier: the same phone at 1440x1080 filming a 1024 tile of 2 px b/w at 30 fps
 //!   (`test/phone_fhd2px_live/dump`, 40 consecutive captures of a live transfer, the manifest among them).
@@ -82,10 +82,11 @@ const FHD: Tier = Tier {
     dir: "test/phone_fhd",
     budget_env: "LB_BUDGET_FHD_MS",
     budget_ms: 127.0,
-    // no capture completes a packet on its own (a fresh stitcher per capture), so the reads' own counts
-    // carry the accuracy signal
-    expected: &[Some(&[]), Some(&[]), Some(&[])],
-    reads: &[Some(&[(2, 83)]), Some(&[(3, 83)]), Some(&[(44, 83)])],
+    // the reads' own counts carry the accuracy signal. 2026-11-04: the colour read starts from the luma pass's
+    // geometry (no second search of the frame: 120-230 -> 66-80 ms a capture); capture 3 tracked reads 40 of 83
+    // where the RGB path's own refit read 44, and its stitched read now completes a packet
+    expected: &[Some(&[]), Some(&[]), Some(&[(39, 83)])],
+    reads: &[Some(&[(2, 83)]), Some(&[(3, 83)]), Some(&[(40, 83)])],
 };
 
 /// A 2 px b/w data frame read whole, and the manifest frame (c8, 12 px) read whole.
@@ -116,7 +117,7 @@ const M: Option<&[(usize, usize)]> = Some(&[(9, 9)]);
 /// The budgets are from runs on a machine shared with other jobs: a loaded laptop reads 20-30% slower (2026-11-02:
 /// 25.6, 24.5 then 20.3 ms in three child runs minutes apart), which the three child runs absorb only when the
 /// load passes; re-measure idle before tightening a budget. The fixtures are not in the repository.
-/// The tier the Full HD phones run: a OnePlus 12 at 1440x1080 filming a 1024 tile of 2 px b/w at 30 fps,
+/// The tier the Full HD phones run: a phone at 1440x1080 filming a 1024 tile of 2 px b/w at 30 fps,
 /// hand-held (`test/phone_fhd2px_live/dump`, 40 consecutive captures of a live transfer). Captures 19 and
 /// 20 show the transfer's manifest frame (c8 at 12 px), which decode_luma hands to the colour path
 /// (`NeedsColour`), as on the phone.

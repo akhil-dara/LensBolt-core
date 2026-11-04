@@ -1,4 +1,4 @@
-//! Full HD 2 px b/w below its comfortable size: real captures (`test/phone_fhd2px_live/dump`, a OnePlus 12 at
+//! Full HD 2 px b/w below its comfortable size: real captures (`test/phone_fhd2px_live/dump`, a phone at
 //! 1440x1080 filming a 1024 tile of 2 px b/w at 1.76 camera px per cell; the 30 of its 40 captures that read
 //! whole, so every cell's true value is known) degraded as a farther or tilted phone would see them: the
 //! capture's pixels integrated again over a larger footprint (a farther camera integrates more screen per

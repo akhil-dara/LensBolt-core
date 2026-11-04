@@ -36,6 +36,13 @@ impl Homography {
         Some(Homography { m })
     }
 
+    /// This map followed by a shift of (dx, dy): a point it sends to (x, y) now goes to (x + dx, y + dy). Moves
+    /// a camera-space geometry into a crop of the picture (dx, dy = minus the crop's origin) and back.
+    pub fn translated(&self, dx: f32, dy: f32) -> Homography {
+        let m = self.m;
+        Homography { m: [m[0] + dx * m[6], m[1] + dx * m[7], m[2] + dx * m[8], m[3] + dy * m[6], m[4] + dy * m[7], m[5] + dy * m[8], m[6], m[7], m[8]] }
+    }
+
     pub fn inverse(&self) -> Option<Homography> {
         let m: Vec<f64> = self.m.iter().map(|&v| v as f64).collect();
         let det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
@@ -56,6 +63,17 @@ impl Homography {
 mod tests {
     use super::*;
     fn close(a: (f32, f32), b: (f32, f32)) -> bool { (a.0 - b.0).abs() < 1e-2 && (a.1 - b.1).abs() < 1e-2 }
+    #[test]
+    fn translated_shifts_every_image_point() {
+        let h = Homography::from_points([(0.0, 0.0), (100.0, 0.0), (100.0, 60.0), (0.0, 60.0)], [(5.0, 7.0), (210.0, 12.0), (205.0, 140.0), (8.0, 128.0)]).unwrap();
+        let t = h.translated(-30.0, 12.5);
+        for p in [(0.0, 0.0), (50.0, 30.0), (100.0, 60.0), (13.0, 47.0)] {
+            let (a, b) = (h.apply(p.0, p.1), t.apply(p.0, p.1));
+            assert!(close((a.0 - 30.0, a.1 + 12.5), b), "{p:?}: {a:?} -> {b:?}");
+        }
+        let back = t.translated(30.0, -12.5);
+        assert!(close(back.apply(77.0, 21.0), h.apply(77.0, 21.0)));
+    }
     #[test]
     fn identity_maps_to_self() {
         let h = Homography::identity();

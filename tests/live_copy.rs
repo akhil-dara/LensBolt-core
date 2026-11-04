@@ -35,7 +35,7 @@ fn offer_at(live: &LiveReceiver, img: RgbImage, chroma: bool, at: Instant) -> bo
     if !live.has_room() { live.skip(); return false; }
     live.submit_capture_at(at, move || {
         let y = img.to_gray();
-        Capture { y, rgb: if chroma { Some(Box::new(move || img)) } else { None } }
+        Capture { y, rgb: if chroma { Some(Box::new(move || img)) } else { None }, origin: (0, 0) }
     })
 }
 

@@ -127,7 +127,7 @@ fn live_receiver_gives_the_same_result() {
     for (n, (t, img)) in shots.iter().enumerate() {
         let i = img.clone().unwrap_or_else(grey);
         while !live.has_room() { std::thread::sleep(Duration::from_millis(1)); }
-        assert!(live.submit_capture_at(base + Duration::from_secs_f64(t / 1000.0), move || Capture { y: i.to_gray(), rgb: Some(Box::new(move || (*i).clone())) }));
+        assert!(live.submit_capture_at(base + Duration::from_secs_f64(t / 1000.0), move || Capture { y: i.to_gray(), rgb: Some(Box::new(move || (*i).clone())), origin: (0, 0) }));
         let t_wait = Instant::now();
         loop {
             let st = live.status();

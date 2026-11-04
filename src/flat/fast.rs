@@ -300,6 +300,9 @@ fn mark_flat_blocks(block_tag: &mut [u8], raw: &[f32], cols: u32, rows: u32, bw:
             a.0 += 1; a.1 += v as f64; a.2 += (v as f64) * (v as f64);
         }
     }
+    // a block mostly out of the picture is left as it is: its cells come with zero margins, suspects RS may
+    // erase or keep (about half are right); marked missing they cost more (3 px with a corner cut off: 8 of 49
+    // codewords as suspects, 0 as erasures, every codeword then over the erasure budget and not tried)
     let spread: Vec<Option<f32>> = acc.iter().map(|&(n, s, ss)| (n >= 32).then(|| { let m = s / n as f64; (ss / n as f64 - m * m).max(0.0).sqrt() as f32 })).collect();
     let mut known: Vec<f32> = spread.iter().flatten().copied().collect();
     if known.len() < 8 { return; }
@@ -733,6 +736,10 @@ pub fn edge_spread(y: &GrayImage, chrome: &Chrome, h: &Homography) -> f32 {
     widths[widths.len() / 2]
 }
 
+thread_local! { static LAST_ANCHOR_PASSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+/// The search-again passes the latest cold anchor field on this thread ran (diagnostics and tests).
+pub fn last_anchor_passes() -> u32 { LAST_ANCHOR_PASSES.with(|p| p.get()) }
+
 /// Read every data cell of a black/white `grid` from the luma plane `y` through `h`. `tag_hint` = the
 /// header's frame sequence & 3; `prev_shifts` = the previous capture's per-block shifts (tracking).
 /// `None` for alphabets this reader does not cover yet (the caller falls back to `read_cells`).
@@ -780,7 +787,7 @@ pub const BLEND_SKIP: f32 = 0.4;
 /// A block row counts as blended (`FlatReads::mix`) when the other frame has more than a quarter of its light:
 /// blends measure 0.49-0.59, clean captures 0.00-0.03 at 1.5-1.9 px per cell, a hard straddle cut under 0.1.
 const MIX_ROW_OTHER: f32 = 0.25;
-/// The tighter count for the pre-check: rows where the other frame has more than this share. A MacBook panel
+/// The tighter count for the pre-check: rows where the other frame has more than this share. A slow LCD panel
 /// settles slowly, so captures carry 15-25% of the previous frame over the whole tile and read 2 of 96 while
 /// the quarter rule says 0.06-0.36.
 const MIX_ROW_OTHER_TIGHT: f32 = 0.18;
@@ -1070,17 +1077,28 @@ fn read_cells_luma_from(y: &GrayImage, grid: &FlatGrid, h: &Homography, tag_hint
         // capture 0 bent 3 cells at the centre: 2.61% cell errors with the first pass alone, 0.514% once
         // settled; clean 0.526%)
         let mut found: Vec<Option<((f32, f32), bool)>> = par_map(aw * ah, |a| search(a, centre));
-        for _ in 1..12 {
+        // ... and stops once the passes stop converging: from the third on, a pass that changes more than three
+        // quarters as many anchors as the one before. A field that settles shrinks fast (the capture bent 3
+        // cells: 100, 19, 11, 0 of 1056; clean ones 3-27 then 0); a capture too soft to read never agrees (160,
+        // 93, 68, 59, 47 ... of 272 for all 12 passes, 50-65 ms of a 150-200 ms failed read on a phone sender
+        // nearer than the lens focuses), and one or two anchors flipping between two answers forever cost a
+        // pass each
+        let mut changed_before = usize::MAX;
+        let mut passes = 0u32;
+        for pass in 1..12 {
             let prevf = &found;
             let again: Vec<Option<((f32, f32), bool)>> = par_map(aw * ah, |a| {
                 let m = around(prevf, a);
                 let stands = match (prevf[a], m) { (Some((s, false)), Some(m)) => (s.0 - m.0).abs() <= 1.5 * st1 && (s.1 - m.1).abs() <= 1.5 * st1, (Some((_, false)), None) => true, _ => false };
                 match m { Some(m) if !stands => search(a, m).or(prevf[a]), _ => prevf[a] }
             });
-            let same = again.iter().zip(prevf).all(|(x, y)| x.map(|v| v.0) == y.map(|v| v.0));
+            let changed = again.iter().zip(prevf).filter(|(x, y)| x.map(|v| v.0) != y.map(|v| v.0)).count();
             found = again;
-            if same { break; }
+            passes = pass;
+            if changed == 0 || (pass >= 2 && changed * 4 > changed_before * 3) { break; }
+            changed_before = changed;
         }
+        LAST_ANCHOR_PASSES.with(|p| p.set(passes));
         let found: Vec<Option<(f32, f32)>> = found.into_iter().map(|f| f.map(|f| f.0)).collect();
         // robust rejection against the searches' own values: an anchor with nothing to read also takes its
         // neighbourhood's median; one with no readable neighbour at all, the median of every anchor (none: 0)

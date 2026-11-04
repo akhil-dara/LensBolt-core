@@ -71,7 +71,7 @@ fn main() {
                 *sum += p.codewords_ok;
                 format!("cw {:>3}/{:<3} mix {:.2} edge {:.2} {ms:>5.1} ms", p.codewords_ok, fr.grid.codewords(), fr.reads.mix, fr.reads.edge_px)
             }
-            Err(e) => format!("{e:?}"),
+            Err(e) => format!("{e:?} {ms:.1} ms"),
         };
         all += tracked.as_ref().or(cold.as_ref()).map(|f| f[0].grid.codewords()).unwrap_or(0);
         let (sc, st) = (show(&cold, tc, &mut sum_c), show(&tracked, tt, &mut sum_t));

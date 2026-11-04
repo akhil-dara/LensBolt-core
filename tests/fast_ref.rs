@@ -1,4 +1,4 @@
-//! The fast luma reader against the reference reader on stored real captures: 1 px b/w, OnePlus 12 at
+//! The fast luma reader against the reference reader on stored real captures: 1 px b/w, a phone at
 //! 3072x3072 (test/lab/burst_00_1793117880), truth from the matching dumps (test/dump/burst_00_1793117880).
 //! Reference (2026-10-29, read_cells): cell errors 0.457, 0.315, 0.464, 0.521 % for captures 0..3, 2004 ms
 //! on one core.
@@ -300,6 +300,27 @@ fn mostly_unreadable_capture_still_returns() {
     let from = (gray.height as usize * 4 / 10) * gray.width as usize;
     gray.data[from..].fill(128);
     assert!(lensbolt_core::flat::fast::read_cells_luma(&gray, &grid, &h, hdr.frame_seq & 3, None).is_some());
+}
+
+/// A capture too soft to read (a phone sender nearer than the lens focuses): its anchors never agree, and the
+/// search-again loop ran all 12 passes, 50-65 ms of a 150-200 ms failed read (a phone reading a phone sender's
+/// 2 px tile, 2026-11-04) where a good read takes about 30. It stops once the passes stop converging (every
+/// pass changing more than three quarters as many anchors as the one before); the field it keeps is no worse.
+#[test]
+fn unreadable_capture_stops_searching_early() {
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LB_THREADS", "1");
+    let Some((img, _)) = real_capture(0) else { eprintln!("skip: captures not stored"); return };
+    let (chrome, h, headers) = FlatDecoder::new().identify(&img).unwrap();
+    let hdr = headers.into_iter().flatten().next().unwrap();
+    let grid = lensbolt_core::flat::FlatGrid::try_new(chrome.width_px(), chrome.height_px(), hdr.format).unwrap();
+    // three box blurs: the cells smear into each other, the border and markers stay
+    let mut soft = img.clone();
+    for _ in 0..3 { soft = lensbolt_core::testutil::box_blur(&soft); }
+    let gray = soft.to_gray();
+    let _ = lensbolt_core::flat::fast::read_cells_luma(&gray, &grid, &h, hdr.frame_seq & 3, None);
+    let passes = lensbolt_core::flat::fast::last_anchor_passes();
+    assert!(passes <= 5, "{passes} search-again passes on an unreadable capture");
 }
 
 /// A hand-held capture bends: a smooth displacement of the content peaking at 3 cells at the tile centre

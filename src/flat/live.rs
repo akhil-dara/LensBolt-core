@@ -52,8 +52,20 @@ pub fn decode_capture(dec: &FlatDecoder, img: &RgbImage, hint: Option<&FlatHint>
 /// The bool says whether RGB was needed.
 pub fn decode_luma_first(dec: &FlatDecoder, y: &GrayImage, rgb: impl FnOnce() -> RgbImage, hint: Option<&FlatHint>) -> Result<(Vec<FlatRead>, bool), DecodeError> {
     match dec.decode_luma(y, hint) {
+        // the colour cells read where the luma pass found the tile (a second search of the whole frame cost more
+        // than the read: a phone's manifest capture took 160 ms on one thread); the full RGB path when that fails
+        Err(DecodeError::NeedsColour(_, Some(at))) => {
+            let img = rgb();
+            let mut frs: Vec<FlatRead> = Vec::new();
+            for hdr in at.headers.into_iter().flatten() {
+                if frs.iter().any(|r: &FlatRead| (r.header.format, r.header.cols, r.header.rows) == (hdr.format, hdr.cols, hdr.rows)) { continue; }
+                if let Ok(fr) = dec.read_frame(&img, &at.chrome, &at.homography, hdr) { frs.push(fr); }
+            }
+            let frs = if frs.is_empty() { decode_capture(dec, &img, hint)? } else { frs };
+            Ok((frs.into_iter().map(|mut r| { r.reads.edge_px = super::fast::edge_spread(y, r.grid.chrome(), &r.homography); r }).collect(), true))
+        }
         // the border's edge width from the Y plane, as the luma path measures it
-        Err(DecodeError::NeedsColour(_)) => decode_capture(dec, &rgb(), hint).map(|mut f| {
+        Err(DecodeError::NeedsColour(_, None)) => decode_capture(dec, &rgb(), hint).map(|mut f| {
             for r in &mut f { r.reads.edge_px = super::fast::edge_spread(y, r.grid.chrome(), &r.homography); }
             (f, true)
         }),
@@ -64,7 +76,7 @@ pub fn decode_luma_first(dec: &FlatDecoder, y: &GrayImage, rgb: impl FnOnce() ->
 #[derive(Clone, Copy, Debug)]
 pub struct LiveConfig { pub workers: usize }
 impl Default for LiveConfig {
-    /// Half the cores: each decode already spreads its hot loops over all of them.
+    /// Half the cores, each worker decoding on its own thread (`par::serial_here`): the captures go side by side.
     fn default() -> Self { LiveConfig { workers: (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).clamp(1, 4) } }
 }
 
@@ -190,7 +202,9 @@ impl LiveStatus {
 /// One camera capture: the Y plane (the b/w fast path reads only this) and, built only when a frame turns out
 /// to be colour (the 12 px c8 manifest, colour data), the RGB image. `rgb` is None when the camera thread
 /// copied only Y (`LiveReceiver::want_chroma` was false): a colour header then costs the capture.
-pub struct Capture { pub y: GrayImage, pub rgb: Option<Box<dyn FnOnce() -> RgbImage + Send>> }
+/// `origin`: where `y` sits in the camera's picture, (0, 0) for the whole picture; a crop (`LiveReceiver::crop_rect`)
+/// carries its corner, and its geometry is moved back into the picture's coordinates after the read.
+pub struct Capture { pub y: GrayImage, pub rgb: Option<Box<dyn FnOnce() -> RgbImage + Send>>, pub origin: (u32, u32) }
 /// A capture to build and decode, with the time it was offered (the sender's rate is read against it).
 type Job = (Instant, Box<dyn FnOnce() -> Capture + Send>);
 /// A worker's result: a read (decode ms, whether it needed RGB), a failure, or a colour header without
@@ -254,6 +268,9 @@ pub struct LiveReceiver {
     /// Tune: the command the collector takes with its next capture, and whether Tune runs (every capture then copies
     /// chroma: the colour segments need it); `epoch` is the collector's clock
     tune_cmd: Arc<Mutex<Option<TuneCmd>>>, tuning: AtomicBool, epoch: Instant,
+    /// the workers' shared geometry (`crop_rect` reads it), and a cropped capture that failed: the next capture
+    /// is taken whole (the tile may have moved out of the crop)
+    hint: Arc<Mutex<Option<FlatHint>>>, whole_next: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -277,14 +294,15 @@ impl LiveReceiver {
         let (done_tx, done_rx) = mpsc::channel::<Done>();
         let hint: Arc<Mutex<Option<FlatHint>>> = Arc::new(Mutex::new(None));
         let free = Arc::new(AtomicUsize::new(workers));
+        let whole_next = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(LiveStatus::default()));
         let chroma = Arc::new(AtomicBool::new(CopyPolicy::new().need_chroma()));
         let starved = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
         for i in 0..workers {
-            let (rx, tx, dec, hint, free, stop) = (work_rx.clone(), done_tx.clone(), dec.clone(), hint.clone(), free.clone(), stop.clone());
-            threads.push(std::thread::Builder::new().name(format!("lb-decode-{i}")).spawn(move || loop {
+            let (rx, tx, dec, hint, free, stop, whole) = (work_rx.clone(), done_tx.clone(), dec.clone(), hint.clone(), free.clone(), stop.clone(), whole_next.clone());
+            threads.push(std::thread::Builder::new().name(format!("lb-decode-{i}")).spawn(move || { crate::par::serial_here(); loop {
                 let job = { let Ok(guard) = rx.lock() else { break }; guard.recv() };
                 let Ok((offered, job)) = job else { break };
                 if stop.load(Ordering::Relaxed) { free.fetch_add(1, Ordering::AcqRel); continue; }
@@ -293,22 +311,31 @@ impl LiveReceiver {
                 // luma first (b/w frames never build RGB); a colour header falls back to the RGB path
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let cap = job();
-                    match cap.rgb {
+                    // a crop: the hint moved into it, the reads moved back into the picture's coordinates
+                    let (ox, oy) = (cap.origin.0 as f32, cap.origin.1 as f32);
+                    let cropped = cap.origin != (0, 0);
+                    let h = if cropped { h.map(|mut x| { x.homography = x.homography.translated(-ox, -oy); x }) } else { h };
+                    let r = match cap.rgb {
                         Some(rgb) => decode_luma_first(&dec, &cap.y, rgb, h.as_ref()),
                         // only Y was copied: a colour header comes back as NeedsColour
                         None => dec.decode_luma(&cap.y, h.as_ref()).map(|f| (f, false)),
-                    }
+                    };
+                    if !cropped { return r; }
+                    // a crop that asked for colour lost nothing (the next colour copy is whole anyway); any other
+                    // failure may be the tile leaving the crop
+                    if matches!(&r, Err(e) if !matches!(e, DecodeError::NeedsColour(..))) { whole.store(true, Ordering::Release); }
+                    r.map(|(mut frs, c)| { for f in &mut frs { f.homography = f.homography.translated(ox, oy); } (frs, c) })
                 }));
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 let msg = match res {
                     Ok(Ok((frs, colour))) => { if let Ok(mut g) = hint.lock() { *g = Some(frs[0].hint()); } Done::Ok(frs, ms, colour, offered) }
-                    Ok(Err(DecodeError::NeedsColour(_))) => Done::NoChroma(offered),
+                    Ok(Err(DecodeError::NeedsColour(..))) => Done::NoChroma(offered),
                     Ok(Err(e)) => Done::Failed(format!("{e:?}"), ms, offered),
                     Err(_) => Done::Failed("Panic".into(), ms, offered),
                 };
                 free.fetch_add(1, Ordering::AcqRel);
                 if tx.send(msg).is_err() { break; }
-            })?);
+            } })?);
         }
         drop(done_tx);
         let (st, stop_c, chroma_c, starved_c, receiver) = (status.clone(), stop.clone(), chroma.clone(), starved.clone(), rx.clone());
@@ -373,13 +400,13 @@ impl LiveReceiver {
             }
         })?);
         Ok(LiveReceiver { work: Some(work_tx), free, stop, status, chroma, starved, rx, received: AtomicU64::new(0), dropped: AtomicU64::new(0), accepted: AtomicU64::new(0), threads,
-            tune_cmd, tuning: AtomicBool::new(false), epoch })
+            tune_cmd, tuning: AtomicBool::new(false), epoch, hint, whole_next })
     }
 
     /// Offer a capture; `make` runs on a worker (convert the camera planes there, not on the camera thread).
     /// Returns false when every worker is busy or the transfer is complete: the capture is dropped.
     pub fn submit<F: FnOnce() -> RgbImage + Send + 'static>(&self, make: F) -> bool {
-        self.submit_capture(move || { let img = make(); Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)) } })
+        self.submit_capture(move || { let img = make(); Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)), origin: (0, 0) } })
     }
     /// `submit` for a camera that hands out a Y plane: `make` builds the capture on a worker.
     /// The offer time is the capture's time for the sender's frame-rate estimate and the copy policy.
@@ -398,6 +425,28 @@ impl LiveReceiver {
         };
         if accepted { self.accepted.fetch_add(1, Ordering::AcqRel); } else { self.dropped.fetch_add(1, Ordering::AcqRel); }
         accepted
+    }
+    /// The region of a `width` x `height` picture to copy for the next capture while the tile is tracked: the
+    /// tile's corners through the latest geometry, a margin of an eighth of its size (at least 32 px) around,
+    /// as [x0, y0, x1, y1). None (copy the whole picture): no geometry yet, the last cropped capture failed (taken
+    /// once), the region would be most of the picture anyway, or a worker holds the geometry right now. A whole
+    /// 12 MP plane costs 6 ms to copy on the camera's thread, the tile's region under 1 ms. A capture that also
+    /// needs colour (`want_chroma`) is copied whole: crops are luma only.
+    pub fn crop_rect(&self, width: u32, height: u32) -> Option<[u32; 4]> {
+        if self.whole_next.swap(false, Ordering::AcqRel) { return None; }
+        let hint = self.hint.try_lock().ok()?.clone()?;
+        let c = hint.chrome;
+        let (w, h) = (c.width_px() as f32, c.height_px() as f32);
+        let pts = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)].map(|p| hint.homography.apply(p.0, p.1));
+        let (x0, x1) = pts.iter().fold((f32::MAX, f32::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+        let (y0, y1) = pts.iter().fold((f32::MAX, f32::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
+        if !(x0.is_finite() && x1.is_finite() && y0.is_finite() && y1.is_finite()) { return None; }
+        let m = (0.125 * (x1 - x0).max(y1 - y0)).max(32.0);
+        let r = [(x0 - m).max(0.0) as u32, (y0 - m).max(0.0) as u32, ((x1 + m).max(0.0) as u32).min(width), ((y1 + m).max(0.0) as u32).min(height)];
+        if r[2] <= r[0] + 64 || r[3] <= r[1] + 64 { return None; }
+        let area = (r[2] - r[0]) as u64 * (r[3] - r[1]) as u64;
+        if area * 10 > width as u64 * height as u64 * 6 { return None; }
+        Some(r)
     }
     /// Count a capture the caller dropped without offering it (no worker was free to take its planes).
     pub fn skip(&self) { self.received.fetch_add(1, Ordering::AcqRel); self.dropped.fetch_add(1, Ordering::AcqRel); }

@@ -103,6 +103,54 @@ fn diagonal_rolls_decode() {
     }
 }
 
+/// One corner of the tile out of the picture (a phone held close and turned a little) or its marker covered:
+/// the other three markers give the geometry, the visible border refines it, and the cells out of view come to
+/// Reed-Solomon as erasures. Read on the luma path, as the phone reads it.
+#[test]
+fn three_markers_decode() {
+    // (pitch, roll, tile px in a 1920x1440 picture, cover the marker instead of cutting it off)
+    for (k, (pitch, roll, tile, cover)) in [(3u8, 15.0f32, 1331.0f32, false), (3, -15.0, 1331.0, false), (2, 15.0, 1300.0, false), (3, 4.0, 1150.0, true)].into_iter().enumerate() {
+        let (g, f, payload) = frame(CellFormat { pitch, alphabet: Alphabet::Bw }, 70 + k as u32);
+        let mut im = render(&f);
+        if cover {
+            // a thumb over the top-right marker and its neighbourhood (7 modules of 4 px, and some more)
+            let (x0, y0) = (1024 - 52, 0);
+            for y in y0..y0 + 52 { for x in x0..x0 + 52 { im.set(x, y, [40, 40, 40]); } }
+        }
+        // rendered centred in a taller picture, then the top 300 rows cut off: one corner out of the top
+        let (cam, cut) = if cover { (synth(&im, 1920, 1440, tile, roll, 1.0, 3, 80 + k as u64), 0u32) } else { (synth(&im, 1920, 1800, tile, roll, 1.0, 3, 80 + k as u64), 300u32) };
+        let mut shown = RgbImage::new(1920, 1440);
+        for y in 0..1440 { for x in 0..1920 { shown.set(x, y, cam.get(x, y + cut)); } }
+        let cam = shown;
+        let what = format!("{pitch} px, roll {roll}, tile {tile} px{}", if cover { ", a marker covered" } else { ", a corner out of the picture" });
+        let reads = FlatDecoder::new().decode_luma(&cam.to_gray(), None).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        let fp = reads[0].payload();
+        let n = g.codewords();
+        assert!(fp.codewords_ok * 100 >= n * 95, "{what}: {}/{n} ({} failed, {} not tried)", fp.codewords_ok, fp.codewords_failed, fp.codewords_missing);
+        assert!(fp.bytes.iter().zip(&payload).zip(&fp.valid).all(|((a, b), &v)| !v || a == b), "{what}: a byte marked valid is wrong");
+    }
+}
+
+/// A full-sensor frame (12 MP): a phone sender's 2 px cells reach about 2.2 camera px at the camera's closest
+/// focus only at the sensor's own resolution (0.8 px in a 1440x1080 stream). The markers are found on a half-size
+/// copy and refined at full size (tiles at 2.2 and 2.7 px per cell).
+#[test]
+fn full_sensor_frame_decodes_cold_and_tracked() {
+    for (k, tile) in [1126.0f32, 1400.0].into_iter().enumerate() {
+        let (g, f, payload) = frame(CellFormat { pitch: 2, alphabet: Alphabet::Bw }, 110 + k as u32);
+        let cam = lensbolt_core::testutil::box_blur(&synth(&render(&f), 4032, 3024, tile, 2.0, 1.0, 2, 120 + k as u64)).to_gray();
+        let dec = FlatDecoder::new();
+        let what = format!("tile {tile} px in 4032x3024");
+        let cold = dec.decode_luma(&cam, None).unwrap_or_else(|e| panic!("{what}: cold {e:?}"));
+        let tracked = dec.decode_luma(&cam, Some(&cold[0].hint())).unwrap_or_else(|e| panic!("{what}: tracked {e:?}"));
+        for (how, r) in [("cold", &cold), ("tracked", &tracked)] {
+            let fp = r[0].payload();
+            assert!(fp.codewords_ok * 100 >= g.codewords() * 95, "{what} {how}: {}/{}", fp.codewords_ok, g.codewords());
+            assert!(fp.bytes.iter().zip(&payload).zip(&fp.valid).all(|((a, b), &v)| !v || a == b), "{what} {how}: a byte marked valid is wrong");
+        }
+    }
+}
+
 /// Part of the tile covered on the sender's screen: a notification box (light grey) or a thumb in front of the
 /// camera (dark), 4% of the tile, away from the corner markers. Every codeword spans the whole tile, so a
 /// covered patch puts errors in all of them; the covered blocks' pilots barely swing, the reader marks those
@@ -228,6 +276,40 @@ fn tracked_decode_uses_the_hint() {
     assert!(warm.decode_ms >= 0.0 && cold.decode_ms >= 0.0);
 }
 
+/// A capture whose header is unreadable while the tracked markers sit where the hint put them and the border
+/// checks out: the tile was not lost, the header was damaged (a capture taken while the sender changed frames,
+/// 14 of 60 phone captures). A cold search there finds the same geometry and fails the same way, at 85 ms
+/// against 31 ms for a read (4 threads), so the tracked path answers NoHeader without one.
+#[test]
+fn tracked_capture_with_a_damaged_header_skips_the_cold_search() {
+    let (g, f, _) = frame(CellFormat { pitch: 3, alphabet: Alphabet::Bw }, 7);
+    let im = render(&f);
+    let dec = FlatDecoder::new();
+    let cold = dec.decode_luma(&synth(&im, 1920, 1440, 1150.0, 2.0, 1.0, 3, 7).to_gray(), None).expect("cold");
+    let hint = cold[0].hint();
+    let mut hurt = im.clone();
+    let chrome = g.chrome();
+    for copy in 0..2 { for i in 0..lensbolt_core::flat::Chrome::HEADER_CELLS {
+        let (x, y) = chrome.header_cell_center(copy, i);
+        for dy in -4i32..4 { for dx in -4i32..4 { hurt.set((x as i32 + dx) as u32, (y as i32 + dy) as u32, [128, 128, 128]); } }
+    } }
+    let hurt = synth(&hurt, 1920, 1440, 1150.0, 2.0, 1.0, 3, 8).to_gray();
+    let before = dec.cold_identifications();
+    let r = dec.decode_luma(&hurt, Some(&hint));
+    assert!(matches!(r, Err(DecodeError::NoHeader)), "{:?}", r.map(|v| v.len()));
+    assert_eq!(dec.cold_identifications(), before, "no cold search for a damaged header under good tracking");
+    // a second miss in a row is no longer one damaged capture: the tracked geometry may have gone wrong, so a
+    // cold search runs (stability over speed there)
+    let _ = dec.decode_luma(&hurt, Some(&hint));
+    assert_eq!(dec.cold_identifications(), before + 1, "the second tracked miss in a row searches cold");
+    // a read resets the count
+    let good = synth(&im, 1920, 1440, 1150.0, 2.0, 1.0, 3, 9).to_gray();
+    assert!(dec.decode_luma(&good, Some(&hint)).is_ok());
+    let n = dec.cold_identifications();
+    let _ = dec.decode_luma(&hurt, Some(&hint));
+    assert_eq!(dec.cold_identifications(), n, "a miss after a read is one damaged capture again");
+}
+
 #[test]
 fn tracked_decode_survives_a_moved_camera() {
     // the hand moves 60 px between captures: the hint's geometry is stale, the frame must still read fully
@@ -289,9 +371,27 @@ fn colour_header_on_luma_path_asks_for_colour() {
     let (_, f, _) = frame(CellFormat { pitch: 4, alphabet: Alphabet::C8 }, 42);
     let cam = synth(&render(&f), 3000, 2400, 1024.0 * 1.85, 1.0, 1.0, 4, 34);
     match FlatDecoder::new().decode_luma(&cam.to_gray(), None) {
-        Err(DecodeError::NeedsColour(h)) => assert_eq!(h.format.alphabet, Alphabet::C8),
+        Err(DecodeError::NeedsColour(h, _)) => assert_eq!(h.format.alphabet, Alphabet::C8),
         other => panic!("expected NeedsColour, got {:?}", other.map(|v| v.len())),
     }
+}
+
+/// A colour frame (the 12 px c8 manifest every transfer reads first) through the live path: the luma pass finds
+/// the tile and its header, and the colour read starts from that geometry, not from a second search of the whole
+/// frame (a phone's manifest capture took 160 ms on one PC thread, 272 ms on four, against about 30 for data).
+#[test]
+fn colour_frame_reads_from_the_luma_geometry() {
+    use lensbolt_core::flat::live::decode_luma_first;
+    let (g, f, payload) = frame(CellFormat { pitch: 4, alphabet: Alphabet::C8 }, 43);
+    let cam = synth(&render(&f), 1920, 1440, 1150.0, 2.0, 1.0, 3, 35);
+    let dec = FlatDecoder::new();
+    let before = dec.cold_identifications();
+    let (reads, colour) = decode_luma_first(&dec, &cam.to_gray(), || cam.clone(), None).expect("colour read");
+    assert!(colour, "the RGB path read it");
+    assert_eq!(dec.cold_identifications(), before + 1, "one search of the frame, by the luma pass");
+    let fp = reads[0].payload();
+    assert!(fp.codewords_ok * 100 >= g.codewords() * 95, "{}/{}", fp.codewords_ok, g.codewords());
+    assert!(fp.bytes.iter().zip(&payload).zip(&fp.valid).all(|((a, b), &v)| !v || a == b), "a byte marked valid is wrong");
 }
 
 fn fhd_frame(fmt: CellFormat, block_id: u32) -> (FlatFrame, Vec<u8>) {

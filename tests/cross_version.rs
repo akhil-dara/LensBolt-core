@@ -187,7 +187,7 @@ fn a_frame_of_another_version_is_its_own_error() {
     std::fs::create_dir_all(&out).unwrap();
     let live = LiveReceiver::new(&out, LiveConfig { workers: 1 }).unwrap();
     let img = frames_of_version(8).remove(1);
-    assert!(live.submit_capture(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)) }));
+    assert!(live.submit_capture(move || Capture { y: img.to_gray(), rgb: Some(Box::new(move || img)), origin: (0, 0) }));
     let t0 = std::time::Instant::now();
     while live.status().failed == 0 { assert!(t0.elapsed().as_secs() < 30, "{:?}", live.status()); std::thread::sleep(std::time::Duration::from_millis(2)); }
     assert_eq!(live.status().last_error.as_deref(), Some("OtherVersion(8)"));

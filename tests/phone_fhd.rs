@@ -1,4 +1,4 @@
-//! Real captures: a OnePlus 12 at Full HD (1440x1080 YUV_420_888, 0.85 camera px per screen px) filming a
+//! Real captures: a phone at Full HD (1440x1080 YUV_420_888, 0.85 camera px per screen px) filming a
 //! 1024x1024 4 px c8 tile on a laptop screen, exposure already lowered (EV -3). Raw planes as the app hands
 //! them to the native receiver (`test/phone_fhd/f_<ms>_<W>x<H>_<yrow>_<uvrow>_<pixel>.{y,u,v}`).
 //! Before the measured-centre colour decision: 2, 3 and 44 of 83 codewords (cell errors 6.5%, 7.2%, 2.2%).

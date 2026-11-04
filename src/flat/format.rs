@@ -56,7 +56,7 @@ impl CellFormat {
 }
 
 /// Manifest frames: the coarsest configuration that still holds one packet in a 1024x768 tile (12 px / 4
-/// colours does not); 12 px / 8 colours read at 1.1% on the Kiyo.
+/// colours does not); 12 px / 8 colours read at 1.1% on a webcam.
 pub const MANIFEST_FORMAT: CellFormat = CellFormat { pitch: 12, alphabet: Alphabet::C8 };
 
 /// The manifest format for a tile: 12 px / 8 colours where it fits (every tile >= 1024 x 768), else the largest

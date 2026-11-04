@@ -128,31 +128,59 @@ fn two_means_of(hist: &[u64; 256], count: usize) -> u8 {
 /// a global Otsu threshold of 84 while the near side read 200+. A floor keeps black areas free of noise.
 pub fn local_binarize(gray: &GrayImage) -> Vec<u8> { local_binarize_r(gray, (gray.width.max(gray.height) as usize / 16).max(8)) }
 /// `local_binarize` with an explicit mean radius (a crop of a frame binarises with the frame's radius).
+///
+/// A u32 integral image whose sums wrap: a window's sum is the same modulo 2^32 and always fits (255 x the
+/// window's area), so the wrapping differences are exact at any frame size, at half the memory of u64. A pixel
+/// is above the window's floor mean exactly when `v * area > sum` (integers), so no division per pixel. Was
+/// 14.9 ms of the 17.5 ms marker search on a 1080x1920 capture (one core); the same bits
+/// (`local_binarize_matches_the_reference`).
 pub fn local_binarize_r(gray: &GrayImage, r: usize) -> Vec<u8> {
     let (w, h) = (gray.width as usize, gray.height as usize);
-    let mut integral = vec![0u64; (w + 1) * (h + 1)];
+    let stride = w + 1;
+    let mut integral = vec![0u32; stride * (h + 1)];
     for y in 0..h {
-        let mut row = 0u64;
+        let src = &gray.data[y * w..(y + 1) * w];
+        let (above, here) = integral[y * stride..(y + 2) * stride].split_at_mut(stride);
+        let mut row = 0u32;
         for x in 0..w {
-            row += gray.data[y * w + x] as u64;
-            integral[(y + 1) * (w + 1) + x + 1] = integral[y * (w + 1) + x + 1] + row;
+            row = row.wrapping_add(src[x] as u32);
+            here[x + 1] = above[x + 1].wrapping_add(row);
         }
     }
     let integral = &integral;
-    crate::par::par_ranges(h, |rows| {
-        let mut out = Vec::with_capacity(rows.len() * w);
-        for y in rows {
-            let (y0, y1) = (y.saturating_sub(r), (y + r + 1).min(h));
-            for x in 0..w {
-                let (x0, x1) = (x.saturating_sub(r), (x + r + 1).min(w));
-                let sum = integral[y1 * (w + 1) + x1] + integral[y0 * (w + 1) + x0] - integral[y0 * (w + 1) + x1] - integral[y1 * (w + 1) + x0];
-                let mean = sum / ((y1 - y0) * (x1 - x0)) as u64;
-                let v = gray.data[y * w + x] as u64;
-                out.push((v > mean.max(24)) as u8);
+    let mut out = vec![0u8; w * h];
+    crate::par::par_chunks_rows(&mut out, w, |y, line| {
+        let (y0, y1) = (y.saturating_sub(r), (y + r + 1).min(h));
+        let (top, bot) = (&integral[y0 * stride..(y0 + 1) * stride], &integral[y1 * stride..(y1 + 1) * stride]);
+        let src = &gray.data[y * w..(y + 1) * w];
+        let rows_in = (y1 - y0) as u32;
+        // the band of rows y0..y1 summed up to each column: a window's sum is the difference of two of these
+        // (exact in u32: a window holds at most 255 x its area, and the area at most (2 r + 1)^2)
+        let band: Vec<u32> = bot.iter().zip(top).map(|(&b, &t)| b.wrapping_sub(t)).collect();
+        // v > floor(sum / area) exactly when v * area > sum; and above the floor of 24
+        let edge = |x: usize| -> u8 {
+            let (x0, x1) = (x.saturating_sub(r), (x + r + 1).min(w));
+            let (sum, area) = (band[x1].wrapping_sub(band[x0]) as u64, rows_in as u64 * (x1 - x0) as u64);
+            let v = src[x] as u64;
+            (v > 24 && v * area > sum) as u8
+        };
+        // the columns whose window lies inside the frame: one area, no clamping (vectorised)
+        let (lo, hi) = if w > 2 * r + 1 { (r, w - r - 1) } else { (w, w) };
+        for x in 0..lo { line[x] = edge(x); }
+        if hi > lo && (rows_in as u64) * (2 * r as u64 + 1) * 255 < u32::MAX as u64 {
+            let area = rows_in * (2 * r as u32 + 1);
+            let (left, right) = (&band[..], &band[2 * r + 1..]);
+            for (x, (o, &v)) in line[lo..hi].iter_mut().zip(&src[lo..hi]).enumerate() {
+                let sum = right[x].wrapping_sub(left[x]);
+                let v = v as u32;
+                *o = (v > 24 && v * area > sum) as u8;
             }
+        } else {
+            for x in lo..hi { line[x] = edge(x); }
         }
-        out
-    }).concat()
+        for x in hi.max(lo)..w { line[x] = edge(x); }
+    });
+    out
 }
 
 /// All marker-like clusters: (x, y, unit, hits). Exposed for diagnostics.
@@ -164,7 +192,7 @@ pub fn find_marker_candidates_r(gray: &GrayImage, radius: usize) -> Vec<(f32, f3
     if w < 8 || h < 8 { return Vec::new(); }
     let bin = local_binarize_r(small, radius);
     let bin = &bin;
-    let hits: Vec<Hit> = crate::par::par_ranges(h as usize, |rows| {
+    let hits: Vec<Hit> = crate::par::par_ranges_px(h as usize, w as usize, |rows| {
     let mut hits: Vec<Hit> = Vec::new();
     for y in rows.start as u32..rows.end as u32 {
         let row = &bin[(y * w) as usize..((y + 1) * w) as usize];
@@ -277,6 +305,38 @@ pub(crate) mod tests {
                 assert!(d < 2.0, "{fmt:?} {w}x{h} marker {i}: found {f:?} expected {e:?} (d={d:.2})");
             }
         }
+    }
+    /// `local_binarize_r` as it was (a u64 integral image, a division per pixel): the reference the faster one
+    /// must match bit for bit.
+    fn local_binarize_reference(gray: &GrayImage, r: usize) -> Vec<u8> {
+        let (w, h) = (gray.width as usize, gray.height as usize);
+        let mut integral = vec![0u64; (w + 1) * (h + 1)];
+        for y in 0..h { let mut row = 0u64; for x in 0..w { row += gray.data[y * w + x] as u64; integral[(y + 1) * (w + 1) + x + 1] = integral[y * (w + 1) + x + 1] + row; } }
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h { let (y0, y1) = (y.saturating_sub(r), (y + r + 1).min(h)); for x in 0..w {
+            let (x0, x1) = (x.saturating_sub(r), (x + r + 1).min(w));
+            let sum = integral[y1 * (w + 1) + x1] + integral[y0 * (w + 1) + x0] - integral[y0 * (w + 1) + x1] - integral[y1 * (w + 1) + x0];
+            let mean = sum / ((y1 - y0) * (x1 - x0)) as u64;
+            out.push((gray.data[y * w + x] as u64 > mean.max(24)) as u8);
+        } }
+        out
+    }
+    #[test]
+    fn local_binarize_matches_the_reference() {
+        let mut st = 0x2545F4914F6CDD1Du64;
+        for (w, h, r) in [(64u32, 48u32, 8usize), (333, 211, 20), (1080, 1920, 120), (17, 9, 30), (512, 512, 1)] {
+            let mut g = crate::image::GrayImage::new(w, h);
+            // a gradient (a screen at an angle), noise, saturated patches and dark corners
+            for y in 0..h { for x in 0..w {
+                st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+                let base = (x * 180 / w.max(1) + y * 60 / h.max(1)) as i32;
+                let v = if (x / 37 + y / 23) % 7 == 0 { 255 } else if x < w / 9 && y < h / 9 { (st % 20) as i32 } else { base + (st % 41) as i32 - 20 };
+                g.data[(y * w + x) as usize] = v.clamp(0, 255) as u8;
+            } }
+            assert!(local_binarize_r(&g, r) == local_binarize_reference(&g, r), "{w}x{h} r {r}");
+        }
+        let big = crate::image::GrayImage { width: 4096, height: 3072, data: vec![255u8; 4096 * 3072] };
+        assert!(local_binarize_r(&big, 256) == local_binarize_reference(&big, 256), "a saturated 12.6 MP frame (the u32 integral wraps)");
     }
     #[test]
     fn corner_set_ignores_roll() {

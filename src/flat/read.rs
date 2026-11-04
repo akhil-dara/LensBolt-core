@@ -44,6 +44,67 @@ pub fn box_blur(img: &RgbImage, k: u32) -> RgbImage {
     out
 }
 
+/// `box_blur` inside `rect` = [x0, y0, x1, y1) only (the rest of the picture black): the same windows and the
+/// same rounding, so every pixel there is `box_blur`'s bit for bit (`region_blur_matches_the_whole_frame_blur_inside_the_region`).
+/// The summed-area table covers the region and its windows' reach only, and the division becomes a multiply by
+/// an exact reciprocal (sums stay far below 2^32 / n). The colour reader blurs only the tile's region: the whole
+/// 1440x1080 frame cost most of the 21 ms first stage of a manifest read.
+pub fn box_blur_region(img: &RgbImage, k: u32, rect: [u32; 4]) -> RgbImage {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let mut out = RgbImage::new(img.width, img.height);
+    let [x0, y0, x1, y1] = [rect[0].min(img.width) as usize, rect[1].min(img.height) as usize, rect[2].min(img.width) as usize, rect[3].min(img.height) as usize];
+    if x1 <= x0 || y1 <= y0 { return out; }
+    if k <= 1 {
+        for y in y0..y1 { out.data[(y * w + x0) * 3..(y * w + x1) * 3].copy_from_slice(&img.data[(y * w + x0) * 3..(y * w + x1) * 3]); }
+        return out;
+    }
+    let (r0, k) = ((k / 2) as usize, k as usize);
+    // the region's windows: x - r0 .. x - r0 + k, clamped to the picture
+    let (ex0, ex1) = (x0.saturating_sub(r0), (x1 - 1 + k).saturating_sub(r0).min(w));
+    let (ey0, ey1) = (y0.saturating_sub(r0), (y1 - 1 + k).saturating_sub(r0).min(h));
+    let (sw, sh) = (ex1 - ex0, ey1 - ey0);
+    let stride = sw + 1;
+    let mut sum = vec![0u32; 3 * stride * (sh + 1)];
+    for y in 0..sh {
+        let src = &img.data[((ey0 + y) * w + ex0) * 3..((ey0 + y) * w + ex1) * 3];
+        let mut row = [0u32; 3];
+        let (above, here) = sum[3 * y * stride..3 * (y + 2) * stride].split_at_mut(3 * stride);
+        for x in 0..sw {
+            for c in 0..3 { row[c] += src[3 * x + c] as u32; here[3 * (x + 1) + c] = above[3 * (x + 1) + c] + row[c]; }
+        }
+    }
+    let recip_of = |n: u32| -> u64 { (1u64 << 32).div_ceil(n as u64) };
+    for y in y0..y1 {
+        let (wy0, wy1) = (y.saturating_sub(r0), (y + k).saturating_sub(r0).min(h));
+        let (ra, rb) = ((wy0 - ey0) * stride, (wy1 - ey0) * stride);
+        let line = &mut out.data[(y * w + x0) * 3..(y * w + x1) * 3];
+        let mut last_n = 0u32;
+        let mut m = 0u64;
+        for (i, x) in (x0..x1).enumerate() {
+            let (wx0, wx1) = (x.saturating_sub(r0), (x + k).saturating_sub(r0).min(w));
+            let n = ((wy1 - wy0) * (wx1 - wx0)) as u32;
+            if n != last_n { last_n = n; m = recip_of(n); }
+            let (a, b) = (ra + wx0 - ex0, ra + wx1 - ex0);
+            let (c, d) = (rb + wx0 - ex0, rb + wx1 - ex0);
+            for ch in 0..3 {
+                let v = sum[3 * d + ch] + sum[3 * a + ch] - sum[3 * b + ch] - sum[3 * c + ch] + n / 2;
+                line[3 * i + ch] = ((v as u64 * m) >> 32) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// The camera region a read through `h` samples: the tile's corners and `margin` camera px around them, clamped
+/// to the `w` x `h` picture, as [x0, y0, x1, y1).
+fn tile_region(h: &Homography, tile_w: f32, tile_h: f32, margin: f32, w: u32, hh: u32) -> [u32; 4] {
+    let pts = [(0.0, 0.0), (tile_w, 0.0), (tile_w, tile_h), (0.0, tile_h)].map(|p| h.apply(p.0, p.1));
+    let (x0, x1) = pts.iter().fold((f32::MAX, f32::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+    let (y0, y1) = pts.iter().fold((f32::MAX, f32::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
+    if !(x0.is_finite() && x1.is_finite() && y0.is_finite() && y1.is_finite()) { return [0, 0, w, hh]; }
+    [(x0 - margin).max(0.0) as u32, (y0 - margin).max(0.0) as u32, ((x1 + margin).max(0.0) as u32 + 1).min(w), ((y1 + margin).max(0.0) as u32 + 1).min(hh)]
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ReadParams {
     /// Alignment search reach in camera px (0 = no search).
@@ -92,7 +153,7 @@ pub const TAG_FLAT: u8 = 254;
 /// Whether `t` is a frame tag (0..4), not `TAG_UNKNOWN` or `TAG_FLAT`.
 pub fn tag_known(t: u8) -> bool { t < 4 }
 impl ReadParams {
-    /// The reader settings measured best for a cell pitch on real phone captures (2026-10-27, OnePlus 12 at
+    /// The reader settings measured best for a cell pitch on real phone captures (2026-10-27, a phone at
     /// 2.2-2.5 camera px per screen px): 1 px cells want a finer alignment step (sampling / 8), wider pooling
     /// (3 blocks) and a 0.7-cell box window -- 991 -> 1324 of 1776 codewords on four captures. Explicit
     /// overrides (auto_reach off) are kept.
@@ -139,13 +200,18 @@ fn sample(src: &RgbImage, h: &Homography, x: f32, y: f32, dx: f32, dy: f32) -> O
 
 fn header_blur(img: &RgbImage, chrome: &Chrome, h: &Homography) -> RgbImage {
     let s = sampling_at(h, chrome.width_px() as f32 / 2.0, chrome.height_px() as f32 / 2.0);
-    box_blur(img, (MODULE_PX as f32 * s * 0.5).round().max(1.0) as u32)
+    let k = (MODULE_PX as f32 * s * 0.5).round().max(1.0) as u32;
+    // the header cells lie inside the tile: only its region is blurred
+    box_blur_region(img, k, tile_region(h, chrome.width_px() as f32, chrome.height_px() as f32, k as f32 + 4.0 * s * MODULE_PX as f32, img.width, img.height))
 }
-fn header_bits_from(src: &RgbImage, chrome: &Chrome, h: &Homography, copy: u32) -> Vec<bool> {
-    let vals: Vec<u8> = (0..Chrome::HEADER_CELLS).map(|i| {
+fn header_values(src: &RgbImage, chrome: &Chrome, h: &Homography, copy: u32) -> Vec<u8> {
+    (0..Chrome::HEADER_CELLS).map(|i| {
         let (x, y) = chrome.header_cell_center(copy, i);
         sample(src, h, x, y, 0.0, 0.0).map(luma).unwrap_or(0)
-    }).collect();
+    }).collect()
+}
+fn header_bits_from(src: &RgbImage, chrome: &Chrome, h: &Homography, copy: u32) -> Vec<bool> {
+    let vals = header_values(src, chrome, h, copy);
     let thr = two_means_threshold(&vals);
     vals.iter().map(|&v| (v > thr) ^ (copy == 1)).collect()
 }
@@ -171,18 +237,24 @@ pub fn read_header_copies_luma(y: &crate::image::GrayImage, chrome: &Chrome, h: 
         let total: u32 = (y0..y1).map(|r| y.data[(r * w + x0) as usize..(r * w + x1) as usize].iter().map(|&v| v as u32).sum::<u32>()).sum();
         total as f32 / ((x1 - x0) * (y1 - y0)) as f32
     };
-    let bits = |copy: u32| -> Vec<bool> {
-        let vals: Vec<u8> = (0..Chrome::HEADER_CELLS).map(|i| {
+    let vals = |copy: u32| -> Vec<u8> {
+        (0..Chrome::HEADER_CELLS).map(|i| {
             let (x, yy) = chrome.header_cell_center(copy, i);
             let (cx, cy) = h.apply(x, yy);
             if cx < 0.0 || cy < 0.0 || cx >= y.width as f32 || cy >= y.height as f32 { return 0; }
             let (x0, y0) = ((cx - k as f32 / 2.0).round() as i32, (cy - k as f32 / 2.0).round() as i32);
             (box_mean(x0, y0, x0 + k, y0 + k) + 0.5) as u8
-        }).collect();
-        let thr = two_means_threshold(&vals);
-        vals.iter().map(|&v| (v > thr) ^ (copy == 1)).collect()
+        }).collect()
     };
-    [FlatHeader::copy_from_bits(&bits(0)), FlatHeader::copy_from_bits(&bits(1))]
+    header_copies_soft(&vals(0), &vals(1))
+}
+
+/// Both header copies from their cells' brightness, soft (`FlatHeader::copy_from_values`); when neither reads
+/// alone, the two as one (`combined_from_values`: a capture of one frame) in copy 0's place.
+fn header_copies_soft(v0: &[u8], v1: &[u8]) -> [HeaderCopy; 2] {
+    let (c0, c1) = (FlatHeader::copy_from_values(v0, false), FlatHeader::copy_from_values(v1, true));
+    if matches!(c0, HeaderCopy::Header(_)) || matches!(c1, HeaderCopy::Header(_)) { return [c0, c1]; }
+    match FlatHeader::combined_from_values(v0, v1) { HeaderCopy::Header(h) => [HeaderCopy::Header(h), c1], _ => [c0, c1] }
 }
 
 /// Both header copies (a capture split across two displayed frames can show two different ones); the
@@ -193,7 +265,7 @@ pub fn read_header(img: &RgbImage, chrome: &Chrome, h: &Homography) -> [Option<F
 /// `read_header`, telling a header of another version from an unreadable copy.
 pub fn read_header_copies(img: &RgbImage, chrome: &Chrome, h: &Homography) -> [HeaderCopy; 2] {
     let src = header_blur(img, chrome, h);
-    [FlatHeader::copy_from_bits(&header_bits_from(&src, chrome, h, 0)), FlatHeader::copy_from_bits(&header_bits_from(&src, chrome, h, 1))]
+    header_copies_soft(&header_values(&src, chrome, h, 0), &header_values(&src, chrome, h, 1))
 }
 
 #[derive(Clone)]
@@ -254,8 +326,12 @@ pub fn read_cells(img: &RgbImage, grid: &FlatGrid, h: &Homography, params: &Read
     let pal = fmt.alphabet.palette();
     let s = sampling(h, grid);
     let k = (fmt.pitch as f32 * s * params.window).round().max(1.0) as u32;
+    // the cells and pilots lie inside the tile, sampled up to the alignment reach off: only that region is
+    // blurred (the reach is set below; 4 cells covers it with room)
+    let margin = k as f32 + 2.0 + (params.reach_px.max(2.5 * s) + 4.0 * fmt.pitch as f32 * s);
+    let region = tile_region(h, grid.chrome().width_px() as f32, grid.chrome().height_px() as f32, margin, img.width, img.height);
     let blurred;
-    let src: &RgbImage = if k > 1 { blurred = box_blur(img, k); &blurred } else { img };
+    let src: &RgbImage = if k > 1 { blurred = box_blur_region(img, k, region); &blurred } else { img };
     let (bw, bh) = grid.blocks();
     let nblocks = (bw * bh) as usize;
     let mut pilots: Vec<Pilot> = grid.pilot_positions().iter().filter_map(|&(c, r)| {
@@ -689,6 +765,23 @@ pub(crate) fn pattern_decide_grid(grid: &FlatGrid, pal: &[[u8; 3]], pilots: &[Pi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // the colour reader blurs only the tile's region (a whole 1440x1080 frame cost most of the manifest's 21 ms
+    // first stage): inside the region every pixel is the whole-frame blur's, bit for bit
+    #[test]
+    fn region_blur_matches_the_whole_frame_blur_inside_the_region() {
+        let (w, h) = (301u32, 187u32);
+        let mut img = RgbImage::new(w, h);
+        let mut st = 0x9E37_79B9u32;
+        for p in img.data.iter_mut() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; *p = (st >> 24) as u8; }
+        for k in [2u32, 3, 4, 7, 12] {
+            let whole = box_blur(&img, k);
+            for r in [[0u32, 0, w, h], [40, 25, 260, 150], [0, 0, 50, 40], [250, 140, 301, 187], [100, 60, 101, 61]] {
+                let part = box_blur_region(&img, k, r);
+                for y in r[1]..r[3] { for x in r[0]..r[2] { assert_eq!(part.get(x, y), whole.get(x, y), "k {k} region {r:?} at ({x}, {y})"); } }
+            }
+        }
+    }
     use crate::detect::Homography;
     use crate::flat::{compose, render, Alphabet, CellFormat, FlatCell, FlatGrid, FlatHeader};
     use crate::header::FrameType;
