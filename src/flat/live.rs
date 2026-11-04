@@ -80,7 +80,8 @@ impl Default for LiveConfig {
     fn default() -> Self { LiveConfig { workers: (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).clamp(1, 4) } }
 }
 
-/// What the app shows. Rates are per wall second since the first capture that showed a tile.
+/// What the app shows. Rates are per wall second since the first capture that showed data (the sender's countdown,
+/// which shows only the manifest while the user aims, is left out).
 #[derive(Clone, Debug, Default)]
 pub struct LiveStatus {
     pub received: u64, pub dropped: u64, pub decoded: u64, pub failed: u64,
@@ -522,7 +523,9 @@ fn collect(s: &mut LiveStatus, msg: Done, stitcher: &mut Stitcher, receiver: &Mu
         }
     };
     s.decoded += 1;
-    let t0 = *t_first.get_or_insert_with(Instant::now);
+    // the rate's clock starts at the first capture that shows data: the sender's countdown holds the manifest
+    // while the user aims (5 s on the sender page), and counting it made the shown rate start low and climb
+    if t_first.is_none() && frs.iter().any(|r| r.header.frame_type == FrameType::Data) { *t_first = Some(Instant::now()); }
     let h = &frs[0].header;
     let luma = h.format.alphabet.is_luma();
     s.format = Some(format!("{}px {} {}x{}", h.format.pitch, h.format.alphabet.name(), frs[0].grid.width_px(), frs[0].grid.height_px()));
@@ -578,7 +581,7 @@ fn collect(s: &mut LiveStatus, msg: Done, stitcher: &mut Stitcher, receiver: &Mu
     s.batch = receiver.batch_counts();
     s.file_sha256 = receiver.file_sha256();
     s.received_bytes = if p.stream_size > 0 { (p.packets_new * crate::fountain::BLOCK_BYTES as u64).min(p.stream_size) } else { 0 };
-    s.seconds = t0.elapsed().as_secs_f64();
+    s.seconds = t_first.map_or(0.0, |t0| t0.elapsed().as_secs_f64());
     if s.seconds > 0.0 { s.mbit_per_s = s.bytes_done.max(s.received_bytes) as f64 * 8.0 / s.seconds / 1e6; }
     match done {
         // stop before the status says complete: a caller that sees `complete` gets no capture accepted

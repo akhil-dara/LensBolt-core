@@ -417,3 +417,31 @@ fn live_receiver_reads_tracked_crops_of_a_large_frame() {
     // capture after the jump; the rest cropped (43 of 66 when written)
     assert!(cropped > whole, "most captures cropped: {cropped} cropped, {whole} whole");
 }
+
+/// The rate is measured from the first capture that shows data: the sender's countdown holds the manifest while
+/// the user aims (5 s on the sender page), and counting it made the shown rate start low and climb for the
+/// whole transfer. Half a second of held manifests, then data: the status's seconds leave the countdown out.
+#[test]
+fn rate_starts_at_the_first_data_capture() {
+    use lensbolt_core::flat::live::Capture;
+    use lensbolt_core::flat::{Alphabet, CellFormat};
+    let src = tmp("live_rate.bin"); pseudo_random_file(&src, 200_000, 25).unwrap();
+    let out = tmp("live_rate_out"); let _ = std::fs::remove_dir_all(&out); std::fs::create_dir_all(&out).unwrap();
+    let cfg = FlatSenderConfig { manifest_every_frames: 10, transfer_id: 95, format: CellFormat { pitch: 3, alphabet: Alphabet::Bw }, ..FlatSenderConfig::default() };
+    let mut s = FlatSender::new(&src, cfg, Some(false)).unwrap();
+    let live = LiveReceiver::new(&out, LiveConfig { workers: 2 }).unwrap();
+    let offer = |im: RgbImage| { let y = im.to_gray(); while !live.submit_capture(move || Capture { y, rgb: Some(Box::new(move || im)), origin: (0, 0) }) { std::thread::sleep(Duration::from_millis(2)); break; } };
+    let t0 = Instant::now();
+    // the countdown: held manifests for 0.5 s
+    while t0.elapsed() < Duration::from_millis(500) { offer(render(&s.hold_manifest_frame())); std::thread::sleep(Duration::from_millis(33)); }
+    let data_from = Instant::now();
+    while live.status().complete.is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(120), "no completion: {:?}", live.status());
+        offer(render(&s.next_frame().unwrap()));
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let st = live.status();
+    let since_data = data_from.elapsed().as_secs_f64();
+    assert!(st.seconds <= since_data + 0.05, "seconds {:.2} counted the countdown (data for {:.2} s, all {:.2} s)", st.seconds, since_data, t0.elapsed().as_secs_f64());
+    assert!(st.seconds > 0.0 && st.mbit_per_s > 0.0, "{st:?}");
+}
